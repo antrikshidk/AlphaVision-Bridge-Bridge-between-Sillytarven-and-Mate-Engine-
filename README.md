@@ -99,9 +99,3 @@ Configure your SillyTavern API settings as follows:
 
 Distributed under the **MIT License**. See `LICENSE` for more information.
 
-```
-
-```
-
----
-
