@@ -1,0 +1,9 @@
+(
+echo opencv-python>=4.8.0
+echo Pillow>=10.0.0
+echo mss>=9.0.1
+echo flask>=3.0.0
+echo flask-cors>=4.0.0
+echo requests>=2.31.0
+echo google-generativeai>=0.8.0
+) > "%USERPROFILE%\Desktop\AlphaVision-Bridge\requirements.txt"

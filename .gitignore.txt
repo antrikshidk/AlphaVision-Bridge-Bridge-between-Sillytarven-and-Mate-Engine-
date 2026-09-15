@@ -1,0 +1,12 @@
+(
+echo alpha_env/
+echo venv/
+echo __pycache__/
+echo *.pyc
+echo *.log
+echo .env
+echo *.exe
+echo *.dll
+echo *.bundle
+echo *.unity3d
+) > "%USERPROFILE%\Desktop\AlphaVision-Bridge\.gitignore"
