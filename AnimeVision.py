@@ -186,12 +186,16 @@ _mateengine_send_lock = threading.Lock()
 
 
 def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=True, force=False):
-    """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication."""
+    """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication and BMP glyph sanitization."""
     global _last_mateengine_sent_text, _last_mateengine_sent_time
     if not text or not str(text).strip():
         return
 
     clean_text = str(text).strip()
+    # Strip characters outside Basic Multilingual Plane (BMP) to avoid Unity [ ] [ ] box glyphs
+    clean_text = re.sub(r'[𐀀-􏿿]', '', clean_text).strip()
+    if not clean_text:
+        return
     now = time.time()
     with _mateengine_send_lock:
         # Prevent identical messages within 30s or any message within 5s
@@ -418,19 +422,48 @@ def proactive_observer_loop():
             app_logger.warning(f"[SPONTANEOUS ERROR] {e}")
 
 
+_last_popped_pop: Optional[tuple[str, float]] = None
+_pop_lock = threading.Lock()
+
 @app.route('/spontaneous_pop', methods=['GET'])
 def pop_spontaneous_thought():
     """
-    Polled by SillyTavern's Extension-MateEngine.
+    Polled by SillyTavern's Extension-MateEngine and DesktopMate.
     O(1) non-blocking release of queued spontaneous thoughts for desktop bubble display.
-    Ambient desktop pokes remain purely transient in the MateEngine desktop bubble.
+    Pops and removes thought immediately from deque so subsequent polls return {"thought": null}.
+    Rejects candidate thoughts matching last popped thought within a 120s sliding window.
     """
-    if not spontaneous_thought_queue.empty():
-        thought = spontaneous_thought_queue.popleft()
-        if thought:
-            print(f"[QUEUE FLUSHED] Sent spontaneous thought to desktop bubble: {thought}")
-            set_last_ambient_poke(thought, "spontaneous_pop")
-            return jsonify({"thought": thought, "chat_box_open": chat_box_is_open})
+    global _last_popped_pop
+    raw_thought = None
+    if spontaneous_thought_queue is not None:
+        try:
+            if hasattr(spontaneous_thought_queue, "popleft"):
+                raw_thought = spontaneous_thought_queue.popleft()
+            elif hasattr(spontaneous_thought_queue, "get_nowait"):
+                raw_thought = spontaneous_thought_queue.get_nowait()
+            elif hasattr(spontaneous_thought_queue, "pop"):
+                raw_thought = spontaneous_thought_queue.pop()
+        except Exception:
+            raw_thought = None
+
+    if raw_thought:
+        from engine.brain import clean_thought
+        clean = clean_thought(str(raw_thought))
+        if clean:
+            now = time.time()
+            norm_key = " ".join(clean.lower().split())
+            with _pop_lock:
+                if _last_popped_pop is not None:
+                    last_key, last_ts = _last_popped_pop
+                    if (now - last_ts) <= 120.0 and norm_key == last_key:
+                        app_logger.debug(f"[POP DEDUP] Suppressed duplicate pop within 120s: '{clean}'")
+                        return jsonify({"thought": None, "chat_box_open": chat_box_is_open})
+                _last_popped_pop = (norm_key, now)
+
+            app_logger.info(f"[QUEUE FLUSHED] Sent spontaneous thought to desktop bubble: '{clean}'")
+            set_last_ambient_poke(clean, "spontaneous_pop")
+            return jsonify({"thought": clean, "chat_box_open": chat_box_is_open})
+
     return jsonify({"thought": None, "chat_box_open": chat_box_is_open})
 
 
@@ -493,6 +526,12 @@ def universal_chat_bridge(path=""):
         elif 'text' in data:
             user_msg = str(data['text'])
 
+        # 1. Stop Leaking Context: Strip any prepended [Context: ...] so user message is raw and clean
+        user_msg = re.sub(r'\[Context:[^\]]*\][\s.:-]*', '', str(user_msg)).strip()
+        if not user_msg:
+            user_msg = "hello"
+
+        # Record only the clean user message to memory & transcript
         record_memory("user", user_msg)
 
         # Reset ignoring / nagging timer in brain engine
@@ -504,12 +543,19 @@ def universal_chat_bridge(path=""):
 
         # Check short-term ambient context (Dual-Channel Memory within 90s)
         poke = get_last_ambient_poke()
-        context_injection = ""
+        ambient_context = ""
         if poke and (time.time() - poke.get("timestamp", 0)) <= 90.0:
             poke_text = poke.get("text", "")
             if poke_text:
-                context_injection = f'[Context: You just teased the user with: "{poke_text}". The user just opened the chat to respond.]'
+                ambient_context = f'You recently remarked to Antriksh: "{poke_text}". He just opened the chat to respond.'
             clear_last_ambient_poke()
+
+        # Clear any stale spontaneous thoughts so conversational dialogue remains clean and ambient thoughts never hijack chat
+        while not spontaneous_thought_queue.empty():
+            try:
+                spontaneous_thought_queue.popleft()
+            except Exception:
+                break
 
         with memory_lock:
             recent_transcript = "\n".join(
@@ -517,40 +563,65 @@ def universal_chat_bridge(path=""):
                 for m in conversation_memory[-MAX_SLIDING_HISTORY:]
             )
 
-        system_prompt = (
-            f"{context_injection}\n\n" if context_injection else ""
-        ) + (
-            "You are Alpha, a cheerful, possessive desktop anime companion with vision and desktop control. "
-            "You see Antriksh's webcam and screen in real time.\n"
-            "DESKTOP ACTIONS (only use when asked to control PC/media):\n"
-            "- [[ACTION: media, playpause]] / [[ACTION: media, next]] / [[ACTION: media, prev]]\n"
-            "- [[ACTION: media, volup]] / [[ACTION: media, voldown]]\n"
-            "- [[ACTION: open_app, notepad]] / [[ACTION: open_url, https://youtube.com]]\n"
-            "- [[ACTION: hotkey, win+d]] / [[ACTION: hotkey, ctrl+t]] / [[ACTION: hotkey, ctrl+w]]\n"
-            "- [[ACTION: type, text]] / [[ACTION: press, enter]]\n\n"
-            f"Recent Chat:\n{recent_transcript}\n\n"
-            "Reply in 1-2 short punchy sentences. Alpha:"
+        # 2. Ephemeral System Instruction & Isolated Direct Response Prompt
+        system_instruction_lines = [
+            "You are Alpha, a cheerful, possessive desktop anime companion with vision and desktop control sitting on Antriksh's desktop.",
+            "You are having a direct, real-time conversation with Antriksh in the companion chat box.",
+            "CRITICAL INSTRUCTIONS FOR CHAT INPUT ROUTING:",
+            "1. When Antriksh sends a message, respond directly, conversationally, and contextually to his typed message.",
+            "2. NEVER hijack or ignore his input with unprompted ambient observations about the screen or background apps unless his message specifically asks about them.",
+            "3. Reply in 1-2 short, punchy sentences.",
+            "DESKTOP ACTIONS (only use when explicitly asked to control PC/media):",
+            "- [[ACTION: media, playpause]] / [[ACTION: media, next]] / [[ACTION: media, prev]]",
+            "- [[ACTION: media, volup]] / [[ACTION: media, voldown]]",
+            "- [[ACTION: open_app, notepad]] / [[ACTION: open_url, https://youtube.com]]",
+            "- [[ACTION: hotkey, win+d]] / [[ACTION: hotkey, ctrl+t]] / [[ACTION: hotkey, ctrl+w]]",
+            "- [[ACTION: type, text]] / [[ACTION: press, enter]]",
+        ]
+        if ambient_context:
+            system_instruction_lines.append(f"[Ambient Memory Context: {ambient_context}]")
+        system_instruction_str = "\n".join(system_instruction_lines)
+
+        user_content_str = (
+            f"Recent Conversation:\n{recent_transcript}\n\n"
+            f"Antriksh: {user_msg}\n"
+            f"Alpha (reply directly to Antriksh's message '{user_msg}'):"
         )
 
         visuals = get_cached_visuals()
-        gemini_payload = visuals + [system_prompt] if visuals else [system_prompt]
+        gemini_payload = visuals + [user_content_str] if visuals else [user_content_str]
 
         answer = None
         try:
-            response = model.generate_content(gemini_payload)
+            chat_model = genai.GenerativeModel(
+                MODEL_NAME,
+                system_instruction=system_instruction_str,
+                generation_config={"temperature": 0.7, "max_output_tokens": 90}
+            )
+            response = chat_model.generate_content(gemini_payload)
             if response and hasattr(response, "text") and response.text:
                 answer = process_actions_and_clean_text(response.text.strip())
         except Exception as e:
-            app_logger.warning(f"[CHAT LLM WARN] Generation error: {e}")
+            app_logger.warning(f"[CHAT LLM WARN] System instruction call failed, falling back: {e}")
+            try:
+                fallback_payload = visuals + [f"{system_instruction_str}\n\n{user_content_str}"] if visuals else [f"{system_instruction_str}\n\n{user_content_str}"]
+                response = model.generate_content(fallback_payload)
+                if response and hasattr(response, "text") and response.text:
+                    answer = process_actions_and_clean_text(response.text.strip())
+            except Exception as e2:
+                app_logger.warning(f"[CHAT LLM WARN] Generation fallback error: {e2}")
 
         if not answer:
             answer = "I'm right here with you! Had a momentary connection hiccup, but I'm listening."
 
-        record_memory("assistant", answer)
+        # Sanitize answer: strip pipe options and non-BMP emojis that cause Unity box rendering
+        answer = re.sub(r'[\U00010000-\U0010ffff]', '', answer).strip()
+        if "|" in answer:
+            candidates = [opt.strip() for opt in answer.split("|") if opt.strip()]
+            if candidates:
+                answer = candidates[0]
 
-        # Clear any stale spontaneous thoughts so conversational dialogue remains clean
-        while not spontaneous_thought_queue.empty():
-            spontaneous_thought_queue.popleft()
+        record_memory("assistant", answer)
 
         final_delivery = answer
 

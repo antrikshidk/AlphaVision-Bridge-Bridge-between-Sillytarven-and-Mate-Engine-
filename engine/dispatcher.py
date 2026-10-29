@@ -54,6 +54,8 @@ class ThoughtQueue:
 
     def append(self, item: str):
         with self._lock:
+            if item in self._deque:
+                return
             self._deque.append(item)
 
     def put(self, item: str, *args, **kwargs):
@@ -111,7 +113,7 @@ class Dispatcher:
         mateengine_port: int = 8787,
         shared_thought_queue: Optional[queue.Queue] = None,
         min_interval_sec: float = 15.0,
-        dedup_window_sec: float = 60.0,
+        dedup_window_sec: float = 120.0,
     ):
         self._port              = mateengine_port
         self._ext_q             = shared_thought_queue    # AnimeVision.py's queue object
@@ -119,6 +121,7 @@ class Dispatcher:
         self._dedup_window_sec  = dedup_window_sec
         self._lock              = threading.Lock()
         self._last_push: float  = 0.0
+        self._last_dispatched_thought: Optional[tuple[str, float]] = None
         self._recent_dispatches: list[tuple[str, float]] = []
 
     # ------------------------------------------------------------------
@@ -151,6 +154,16 @@ class Dispatcher:
         now = time.time()
 
         with self._lock:
+            # 0. Deduplicate against in-memory last_dispatched_thought cache within 120s sliding window
+            if self._last_dispatched_thought is not None:
+                last_text, last_ts = self._last_dispatched_thought
+                if (now - last_ts) <= self._dedup_window_sec and norm_key == last_text:
+                    logger.warning(
+                        "[DISPATCHER DEDUP] Suppressed duplicate thought matching last_dispatched_thought within %.1fs: '%s'",
+                        self._dedup_window_sec, clean_remark
+                    )
+                    return False
+
             # Purge records older than dedup window
             self._recent_dispatches = [
                 (text, ts) for text, ts in self._recent_dispatches
@@ -167,7 +180,7 @@ class Dispatcher:
                     )
                     return False
 
-                # 2. Dedup check: identical message sent within last 60s
+                # 2. Dedup check: identical message sent within sliding window
                 for past_text, past_ts in self._recent_dispatches:
                     if past_text == norm_key:
                         logger.warning(
@@ -176,8 +189,9 @@ class Dispatcher:
                         )
                         return False
 
-            # Passed checks: register dispatch timestamp under lock
+            # Passed checks: register dispatch timestamp under lock & update last_dispatched_thought cache
             self._last_push = now
+            self._last_dispatched_thought = (norm_key, now)
             self._recent_dispatches.append((norm_key, now))
 
         t = threading.Thread(
@@ -255,6 +269,11 @@ class Dispatcher:
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
+    @property
+    def last_dispatched_thought(self) -> Optional[tuple[str, float]]:
+        with self._lock:
+            return self._last_dispatched_thought
+
     @property
     def last_push_time(self) -> float:
         with self._lock:

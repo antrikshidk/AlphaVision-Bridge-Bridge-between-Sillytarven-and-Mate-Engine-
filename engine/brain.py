@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import threading
 import queue
@@ -48,6 +49,16 @@ EVAL_TICK                 = 30         # how often the cognitive loop ticks (sec
 # ---------------------------------------------------------------------------
 # Output Sanitization & Truncation Filter
 # ---------------------------------------------------------------------------
+def sanitize_dialogue_text(text: str) -> str:
+    """
+    Strips characters outside the Basic Multilingual Plane (BMP) (high-surrogate emojis
+    and symbols) that render as empty rectangular boxes [ ] [ ] in Unity text renderer.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    return re.sub(r'[\U00010000-\U0010ffff]', '', text).strip()
+
+
 def clean_thought(raw_text: str) -> Optional[str]:
     """
     Cleans, deduplicates candidates, and enforces strict single-sentence truncation:
@@ -65,11 +76,17 @@ def clean_thought(raw_text: str) -> Optional[str]:
         if text.startswith(prefix):
             text = text[len(prefix):].strip().strip('"\'')
 
+    # Strip characters outside the Basic Multilingual Plane (BMP)
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text).strip()
+
     # 1. Strip pipe separators and pick ONLY ONE single clean thought
     if "|" in text:
         candidates = [opt.strip().strip('"\'') for opt in text.split("|") if opt.strip()]
         if candidates:
             text = candidates[0]
+
+    # Re-strip characters outside the BMP in case candidate splitting exposed anything
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text).strip()
 
     # 2. Normalize whitespace into a single line
     text = " ".join(text.split())

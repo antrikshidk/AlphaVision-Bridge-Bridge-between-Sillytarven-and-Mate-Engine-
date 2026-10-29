@@ -414,6 +414,19 @@ class TestDispatcher(unittest.TestCase):
         diff_ok = d.push("Completely distinct remark")
         self.assertTrue(diff_ok, "Distinct remark should succeed")
 
+    def test_last_dispatched_thought_sliding_window_120s(self):
+        """Dispatcher must cache last_dispatched_thought and reject duplicates within 120s."""
+        q = queue.Queue()
+        d = Dispatcher(mateengine_port=self.port, shared_thought_queue=q, min_interval_sec=0.0, dedup_window_sec=120.0)
+        ok1 = d.push("Observing your desktop workflow.")
+        self.assertTrue(ok1)
+        self.assertIsNotNone(d.last_dispatched_thought)
+        self.assertEqual(d.last_dispatched_thought[0], "observing your desktop workflow.")
+
+        # Immediate repeat should be blocked by last_dispatched_thought cache
+        ok2 = d.push("observing your desktop workflow.")
+        self.assertFalse(ok2, "Duplicate within 120s must be suppressed")
+
 
 # ---------------------------------------------------------------------------
 # 7. ChatBox Debouncer Hysteresis Tests
@@ -612,6 +625,21 @@ class TestCleanThoughtAndFormatting(unittest.TestCase):
         item = q.get_nowait()
         self.assertEqual(item, "Candidate One")
 
+    def test_strip_high_unicode_and_emojis(self):
+        """Characters outside Basic Multilingual Plane (BMP) must be stripped to prevent Unity box rendering."""
+        from engine.brain import sanitize_dialogue_text
+        raw = "Hello Antriksh 😊! Studying chemistry 🚀 or physics 🧪? | Option 2"
+        cleaned = clean_thought(raw)
+        self.assertNotIn("😊", cleaned)
+        self.assertNotIn("🚀", cleaned)
+        self.assertNotIn("🧪", cleaned)
+        self.assertNotIn("|", cleaned)
+        self.assertEqual(cleaned, "Hello Antriksh ! Studying chemistry or physics ?")
+
+        # Verify sanitize_dialogue_text
+        sanitized = sanitize_dialogue_text("Unity 🎮 text test 🤖")
+        self.assertEqual(sanitized, "Unity  text test")
+
 
 # ---------------------------------------------------------------------------
 # 11. SafeScreenGrabber & Anti-DWM Flickering Tests
@@ -787,6 +815,37 @@ class TestIgnoringAndNaggingTriggers(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 14. ThoughtQueue & Context Input Routing Tests
+# ---------------------------------------------------------------------------
+class TestThoughtQueueAndInputRouting(unittest.TestCase):
+
+    def test_thought_queue_duplicate_rejection_and_immediate_pop(self):
+        """ThoughtQueue must not store duplicate queued remarks and popleft must remove immediately."""
+        from engine.dispatcher import ThoughtQueue
+        tq = ThoughtQueue(maxlen=5)
+        tq.append("Remark 1")
+        tq.append("Remark 1")  # duplicate append should be no-op
+        self.assertEqual(len(tq), 1)
+
+        popped = tq.popleft()
+        self.assertEqual(popped, "Remark 1")
+        # Deque must now be empty so next pop returns None
+        self.assertIsNone(tq.popleft())
+        self.assertTrue(tq.empty())
+
+    def test_context_leak_stripping_from_user_message(self):
+        """Prepended [Context: ...] string in user input must be cleanly stripped so raw message is pure."""
+        import re
+        leaked_input = '[Context: You just teased the user with: "Ooh studying chemistry already?"].\n\nhi'
+        cleaned = re.sub(r'\[Context:[^\]]*\][\s.:-]*', '', leaked_input).strip()
+        self.assertEqual(cleaned, "hi")
+
+        leaked_input_2 = '[Context: You just teased the user with: "Take a break"] this'
+        cleaned_2 = re.sub(r'\[Context:[^\]]*\][\s.:-]*', '', leaked_input_2).strip()
+        self.assertEqual(cleaned_2, "this")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -807,6 +866,7 @@ if __name__ == "__main__":
         TestSafeScreenGrabber,
         TestAmbientPokeContext,
         TestIgnoringAndNaggingTriggers,
+        TestThoughtQueueAndInputRouting,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

@@ -4,7 +4,16 @@
  */
 
 import { getContext, extension_settings } from '../../../extensions.js';
-import { eventSource, event_types, saveSettingsDebounced, sendMessageAsUser, Generate } from '../../../../script.js';
+import {
+    eventSource,
+    event_types,
+    saveSettingsDebounced,
+    sendMessageAsUser,
+    Generate,
+    setExtensionPrompt,
+    extension_prompt_types,
+    extension_prompt_roles,
+} from '../../../../script.js';
 
 // Try to import slash command registration - different locations in different ST versions
 let registerSlashCommand;
@@ -840,25 +849,58 @@ async function processPendingChats() {
                 const chatLengthBefore = context.chat.length;
 
                 // Check for short-term ambient poke context within 90s (Dual-Channel Memory)
-                let userPrompt = request.message;
+                // Keep raw user message completely clean; inject ambient context as ephemeral system prompt
+                const rawUserMessage = request.message;
+                let ambientContextPrompt = '';
                 try {
                     const pokeRes = await fetch('http://127.0.0.1:5001/last_ambient_poke');
                     if (pokeRes.ok) {
                         const pokeData = await pokeRes.json();
                         if (pokeData && pokeData.valid && pokeData.poke && pokeData.poke.text) {
                             console.log(`${DEBUG_PREFIX} Ambient poke context active:`, pokeData.poke.text);
-                            userPrompt = `[Context: You just teased the user with: "${pokeData.poke.text}". The user just opened the chat to respond.]\n${userPrompt}`;
+                            ambientContextPrompt = `[Context: You recently teased or spoke to the user with: "${pokeData.poke.text}". The user is now responding to you.]`;
+                            if (typeof setExtensionPrompt === 'function') {
+                                const promptType = (typeof extension_prompt_types !== 'undefined' && extension_prompt_types.IN_PROMPT !== undefined)
+                                    ? extension_prompt_types.IN_PROMPT
+                                    : 0;
+                                const promptRole = (typeof extension_prompt_roles !== 'undefined' && extension_prompt_roles.SYSTEM !== undefined)
+                                    ? extension_prompt_roles.SYSTEM
+                                    : 0;
+                                setExtensionPrompt('MateEngine_AmbientContext', ambientContextPrompt, promptType, 0, false, promptRole);
+                            }
                         }
                     }
                 } catch (e) {
                     // Vision server offline or busy
                 }
 
-                await sendMessageAsUser(userPrompt, '');
+                // Send purely clean user message without prepended prompt leak
+                await sendMessageAsUser(rawUserMessage, '');
+
+                // Ensure UI display DOM strips out any injected prefix before saving to chat history
+                try {
+                    const chatEl = document.querySelector('#chat');
+                    if (chatEl) {
+                        const userMesNodes = chatEl.querySelectorAll('.mes[is_user="true"] .mes_text');
+                        if (userMesNodes && userMesNodes.length > 0) {
+                            const lastNode = userMesNodes[userMesNodes.length - 1];
+                            if (lastNode && lastNode.textContent.includes('[Context:')) {
+                                lastNode.innerHTML = lastNode.innerHTML.replace(/\[Context:[^\]]*\]\s*/g, '');
+                            }
+                        }
+                    }
+                } catch (domErr) {}
 
                 console.log(`${DEBUG_PREFIX} Triggering AI generation and awaiting completion...`);
                 // Await Generate('normal') and capture result directly
                 const genResult = await Generate('normal');
+
+                // Clear ephemeral extension prompt immediately after generation
+                if (typeof setExtensionPrompt === 'function') {
+                    try {
+                        setExtensionPrompt('MateEngine_AmbientContext', '', 0, 0);
+                    } catch (clearErr) {}
+                }
 
                 let aiResponse = null;
                 const directText = (genResult !== null && genResult !== undefined) ? String(genResult).trim() : '';
