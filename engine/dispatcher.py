@@ -222,16 +222,19 @@ class Dispatcher:
                 logger.warning("[DISPATCHER] Shared queue push failed: %s", exc)
 
         # 2. Attempt direct POST to MateEngine :8787/api/chat
-        #    This triggers ChatBot.DisplayAIResponse in the patched DLL so the
-        #    speech bubble updates immediately without waiting for SillyTavern
-        #    to poll /spontaneous_pop.
+        #    This triggers ChatBot.DisplayAIResponse and the active speech bubble in
+        #    MateEngine's runtime immediately without waiting for SillyTavern to poll.
         payload = {
             "text":            remark,
+            "message":         remark,
             "characterName":   _CHARACTER_NAME,
+            "sender":          _CHARACTER_NAME,
             "emotion":         emotion,
             "triggerLipSync":  True,
-            "showBubble":      False,  # Disable persistent desktop stacking bubbles (dialogue pipes to SillyTavern chat)
-            "spontaneous":     True,   # marker so MateEngine can style differently if needed
+            "showBubble":      True,
+            "is_bubble":       True,
+            "add_to_chat":     True,
+            "spontaneous":     True,
         }
 
         url = f"http://127.0.0.1:{self._port}/api/chat"

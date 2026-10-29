@@ -193,12 +193,17 @@ _dismiss_timer: Optional[threading.Timer] = None
 _dismiss_lock = threading.Lock()
 
 def clear_mateengine_bubble():
-    """Sends an empty payload to :8787/api/chat with showBubble=False to clear speech bubbles."""
+    """Sends empty/standUp payload to :8787/api/chat and :8787/api/native-animation to clear speech bubbles."""
     try:
-        url = f"http://127.0.0.1:{MATEENGINE_PORT}/api/chat"
-        requests.post(url, json={"text": "", "characterName": "Alpha", "showBubble": False}, timeout=1.0)
-    except Exception:
-        pass
+        url_chat = f"http://127.0.0.1:{MATEENGINE_PORT}/api/chat"
+        requests.post(url_chat, json={"text": "", "message": "", "characterName": "Alpha", "sender": "Alpha", "showBubble": False, "is_bubble": False}, timeout=1.0)
+    except Exception as e:
+        app_logger.debug(f"[BUBBLE DISMISS] Failed to clear MateEngine bubble via /api/chat: {e}")
+    try:
+        url_stand = f"http://127.0.0.1:{MATEENGINE_PORT}/api/native-animation"
+        requests.post(url_stand, json={"standUp": True}, timeout=1.0)
+    except Exception as e:
+        app_logger.debug(f"[BUBBLE DISMISS] Failed to clear MateEngine bubble via /api/native-animation: {e}")
 
 def schedule_bubble_auto_dismiss(delay_sec: float = 4.5):
     """Schedules an auto-dismissal of any active speech bubble in MateEngine after delay_sec."""
@@ -214,7 +219,7 @@ def schedule_bubble_auto_dismiss(delay_sec: float = 4.5):
         _dismiss_timer.start()
 
 
-def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=False, force=False):
+def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=True, force=False):
     """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication and BMP glyph sanitization."""
     global _last_mateengine_sent_text, _last_mateengine_sent_time
     if not text or not str(text).strip():
@@ -222,7 +227,7 @@ def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lips
 
     clean_text = str(text).strip()
     # Strip characters outside Basic Multilingual Plane (BMP) to avoid Unity [ ] [ ] box glyphs
-    clean_text = re.sub(r'[𐀀-􏿿]', '', clean_text).strip()
+    clean_text = re.sub(r'[\U00010000-\U0010ffff]', '', clean_text).strip()
     if not clean_text:
         return
     now = time.time()
@@ -238,10 +243,15 @@ def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lips
     url = f"http://127.0.0.1:{MATEENGINE_PORT}/api/chat"
     payload = {
         "text": clean_text,
+        "message": clean_text,
         "characterName": character_name,
+        "sender": character_name,
         "emotion": emotion,
         "triggerLipSync": trigger_lipsync,
-        "showBubble": show_bubble
+        "showBubble": show_bubble,
+        "is_bubble": show_bubble,
+        "add_to_chat": True,
+        "spontaneous": True
     }
     try:
         requests.post(url, json=payload, timeout=1.5)
@@ -301,7 +311,7 @@ def live_sensor_and_cache_worker():
                                     "character_name": "Alpha",
                                     "emotion": "joy",
                                     "trigger_lipsync": True,
-                                    "show_bubble": False
+                                    "show_bubble": True
                                 },
                                 daemon=True
                             ).start()
@@ -691,7 +701,7 @@ def universal_chat_bridge(path=""):
                     "character_name": "Alpha",
                     "emotion": "joy",
                     "trigger_lipsync": True,
-                    "show_bubble": False
+                    "show_bubble": True
                 },
                 daemon=True
             ).start()

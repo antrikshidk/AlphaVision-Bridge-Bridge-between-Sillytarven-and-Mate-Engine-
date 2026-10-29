@@ -305,10 +305,15 @@ async function sendChatMessage(text, characterName = null, emotion = null, showB
 
     const data = {
         text: text,
+        message: text,
         characterName: characterName,
+        sender: characterName,
         emotion: emotion ? (EMOTION_MAP[emotion.toLowerCase()] || emotion) : null,
         triggerLipSync: settings.autoLipSync !== false,
-        showBubble: shouldShowBubble
+        showBubble: shouldShowBubble,
+        is_bubble: shouldShowBubble,
+        add_to_chat: true,
+        spontaneous: true
     };
     const result = await sendToBridge('chat', data);
 
@@ -1030,8 +1035,8 @@ async function processSpontaneousThoughts() {
 
         console.log(`${DEBUG_PREFIX} Ingested spontaneous thought from AnimeVision: "${cleanText}"`);
 
-        // 1. Channel A: Animate 3D avatar & lip sync without stacking desktop speech bubbles
-        await sendChatMessage(cleanText, characterName, 'joy', false);
+        // 1. Channel A: Animate 3D avatar & lip sync, display in MateEngine chat box & active bubble
+        await sendChatMessage(cleanText, characterName, 'joy', true);
 
         // 2. Channel B: Pipe ALL spontaneous thoughts directly into SillyTavern active chat
         const settings = extension_settings[MODULE_NAME] || {};

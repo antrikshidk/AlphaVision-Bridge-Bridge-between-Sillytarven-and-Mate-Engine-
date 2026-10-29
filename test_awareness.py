@@ -901,14 +901,18 @@ class TestMediaPipeImportAndInChatSpontaneousPoking(unittest.TestCase):
         t2 = '[Thinking: Idle poke] You have been quiet.'
         self.assertEqual(clean_spontaneous_text(t2), "You have been quiet.")
 
-    def test_spontaneous_remarks_show_bubble_disabled(self):
-        """Dispatcher payload must set showBubble: False to eliminate persistent desktop stacking bubbles."""
+    def test_spontaneous_remarks_payload_dual_channel(self):
+        """Dispatcher payload must include message, sender, is_bubble, add_to_chat and showBubble: True."""
         q = queue.Queue()
         d = Dispatcher(mateengine_port=self.__class__.port if hasattr(self.__class__, "port") else 8787, shared_thought_queue=q)
         # Verify the delivery payload configuration
         import inspect
         src = inspect.getsource(d._deliver)
-        self.assertIn('"showBubble":      False', src)
+        self.assertIn('"showBubble":      True', src)
+        self.assertIn('"is_bubble":       True', src)
+        self.assertIn('"add_to_chat":     True', src)
+        self.assertIn('"message":         remark', src)
+        self.assertIn('"sender":          _CHARACTER_NAME', src)
 
 
 
@@ -948,12 +952,12 @@ class TestVisionGatingAndBubbleDismissal(unittest.TestCase):
             # Clean up timer so test exits cleanly
             AnimeVision._dismiss_timer.cancel()
 
-    def test_chat_reply_show_bubble_disabled(self):
-        """AnimeVision chat reply dispatcher must send show_bubble=False by default."""
+    def test_chat_reply_show_bubble_active(self):
+        """AnimeVision chat reply dispatcher must send show_bubble=True to display in dialogue window."""
         import inspect
         from AnimeVision import universal_chat_bridge
         src = inspect.getsource(universal_chat_bridge)
-        self.assertIn('"show_bubble": False', src)
+        self.assertIn('"show_bubble": True', src)
 
 
 if __name__ == "__main__":
