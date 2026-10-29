@@ -30,6 +30,7 @@ import pyautogui
 import numpy as np
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -72,9 +73,16 @@ file_handler = RotatingFileHandler(
 file_handler.setFormatter(log_formatter)
 root_logger.addHandler(file_handler)
 
-# Console handler (when running in terminal)
-if sys.stdout is not None and hasattr(sys.stdout, "write"):
-    console_handler = logging.StreamHandler(sys.stdout)
+# Console handler (when running in terminal, using raw stdout with utf-8 protection)
+if sys.__stdout__ is not None and hasattr(sys.__stdout__, "write"):
+    try:
+        if hasattr(sys.__stdout__, "reconfigure"):
+            sys.__stdout__.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.__stderr__, "reconfigure"):
+            sys.__stderr__.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+    console_handler = logging.StreamHandler(sys.__stdout__)
     console_handler.setFormatter(log_formatter)
     root_logger.addHandler(console_handler)
 
@@ -84,43 +92,15 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 app_logger = logging.getLogger("alphavision")
 
 
-class _StreamToLogger:
-    """Redirects stdout and stderr to the rotating file logger for silent pythonw.exe execution."""
-    def __init__(self, logger_instance, level=logging.INFO):
-        self._logger = logger_instance
-        self._level = level
-        self._buf = ""
-        self.encoding = "utf-8"
+# Direct raw stream redirection for stdout and stderr (100% immune to logging recursion)
+stdout_log_path = os.path.join(LOG_DIR, "stdout.log")
+stderr_log_path = os.path.join(LOG_DIR, "stderr.log")
 
-    def write(self, message):
-        if not message:
-            return
-        if isinstance(message, bytes):
-            message = message.decode("utf-8", errors="replace")
-        elif not isinstance(message, str):
-            message = str(message)
-        self._buf += message
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.rstrip("\r")
-            if line.strip():
-                self._logger.log(self._level, line)
-
-    def flush(self):
-        if self._buf.strip():
-            self._logger.log(self._level, self._buf.rstrip("\r"))
-            self._buf = ""
-
-    def isatty(self):
-        return False
-
-    def reconfigure(self, **kwargs):
-        pass
-
-
-# Stream redirection for headless/pythonw mode
-sys.stdout = _StreamToLogger(app_logger, logging.INFO)
-sys.stderr = _StreamToLogger(app_logger, logging.ERROR)
+try:
+    sys.stdout = open(stdout_log_path, "a", encoding="utf-8", buffering=1)
+    sys.stderr = open(stderr_log_path, "a", encoding="utf-8", buffering=1)
+except Exception:
+    pass
 
 # ================= CONFIGURATION =================
 # Strictly load API credentials from environment (.env)
@@ -479,6 +459,19 @@ def get_ambient_poke_endpoint():
     return jsonify({"poke": None, "valid": False})
 
 
+@app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Explicit health check endpoint returning HTTP 200 for watchdog supervisor and SillyTavern."""
+    return jsonify({
+        "status": "ok",
+        "health": "healthy",
+        "model": MODEL_NAME,
+        "chat_box_open": chat_box_is_open,
+        "timestamp": int(time.time())
+    }), 200
+
+
 # =========================================================
 # 4. SMART HOLD-QUEUE CHAT BRIDGE
 # =========================================================
@@ -822,7 +815,7 @@ def _graceful_shutdown(signum, frame):
     Signal handler for SIGINT / SIGTERM.
     Stops subconscious engine threads, releases camera, flushes state.
     """
-    print("\n[SYSTEM] Shutdown signal received — cleaning up...")
+    print("\n[SYSTEM] Shutdown signal received - cleaning up...")
     if _awareness_perception:
         _awareness_perception.stop()
     if _awareness_brain:
@@ -848,6 +841,6 @@ if __name__ == '__main__':
     threading.Thread(target=_bridge_health_watchdog, daemon=True, name="BridgeWatchdog").start()
 
     print(f"[SYSTEM] Full stack active on port {FLASK_PORT}.")
-    print(f"[SYSTEM]   → Perception + Brain + Dispatcher (AlphaVision Subconscious)")
-    print(f"[SYSTEM]   → Opaque Input Sensor + Hold Queue + Desktop Mod")
+    print(f"[SYSTEM]   -> Perception + Brain + Dispatcher (AlphaVision Subconscious)")
+    print(f"[SYSTEM]   -> Opaque Input Sensor + Hold Queue + Desktop Mod")
     app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, threaded=True, use_reloader=False)
