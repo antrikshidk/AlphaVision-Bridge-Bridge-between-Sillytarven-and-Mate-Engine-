@@ -165,7 +165,7 @@ _last_mateengine_sent_time = 0.0
 _mateengine_send_lock = threading.Lock()
 
 
-def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=True, force=False):
+def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=False, force=False):
     """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication and BMP glyph sanitization."""
     global _last_mateengine_sent_text, _last_mateengine_sent_time
     if not text or not str(text).strip():
@@ -440,7 +440,7 @@ def pop_spontaneous_thought():
                         return jsonify({"thought": None, "chat_box_open": chat_box_is_open})
                 _last_popped_pop = (norm_key, now)
 
-            app_logger.info(f"[QUEUE FLUSHED] Sent spontaneous thought to desktop bubble: '{clean}'")
+            app_logger.info(f"[QUEUE FLUSHED] Dispatched spontaneous thought to active chat: '{clean}'")
             set_last_ambient_poke(clean, "spontaneous_pop")
             return jsonify({"thought": clean, "chat_box_open": chat_box_is_open, "timestamp": now})
 

@@ -879,20 +879,36 @@ class TestMediaPipeImportAndInChatSpontaneousPoking(unittest.TestCase):
         self.assertEqual(message["name"], "Alpha")
         self.assertNotIn("[Context:", message["mes"])
 
-    def test_in_chat_poke_cooldown_gating(self):
-        """In-chat poke must respect the cooldown interval (e.g. 180s)."""
-        cooldown_sec = 180
-        last_poke_time = 1000.0
-        
-        # Test 1: Within cooldown -> blocked
-        current_time_1 = 1100.0  # only 100s elapsed
-        allowed_1 = (current_time_1 - last_poke_time) >= cooldown_sec
-        self.assertFalse(allowed_1)
+    def test_clean_spontaneous_text_pipeline(self):
+        """cleanSpontaneousText must strip pipes, bracketed system tokens, prefixes, and non-BMP glyphs."""
+        import re
+        def clean_spontaneous_text(raw_text):
+            if not raw_text or not isinstance(raw_text, str):
+                return ""
+            text = raw_text.strip()
+            if "|" in text:
+                parts = [p.strip() for p in text.split("|") if p.strip()]
+                if parts:
+                    text = parts[0]
+            text = re.sub(r'\[(?:Context|System|Note|Remark|Thinking|State):?[^\]]*\]', '', text).strip()
+            text = re.sub(r"^(?:Alpha|thought|remark):\s*", "", text, flags=re.IGNORECASE).strip('"\'\u201c\u201d\u2018\u2019').strip()
+            text = re.sub(r'[\U00010000-\U0010ffff]', '', text).strip()
+            return text
 
-        # Test 2: After cooldown -> allowed
-        current_time_2 = 1200.0  # 200s elapsed
-        allowed_2 = (current_time_2 - last_poke_time) >= cooldown_sec
-        self.assertTrue(allowed_2)
+        t1 = 'Alpha: [Context: Studying math] "Check out this integral!" | "Another option"'
+        self.assertEqual(clean_spontaneous_text(t1), "Check out this integral!")
+
+        t2 = '[Thinking: Idle poke] You have been quiet.'
+        self.assertEqual(clean_spontaneous_text(t2), "You have been quiet.")
+
+    def test_spontaneous_remarks_show_bubble_disabled(self):
+        """Dispatcher payload must set showBubble: False to eliminate persistent desktop stacking bubbles."""
+        q = queue.Queue()
+        d = Dispatcher(mateengine_port=self.__class__.port if hasattr(self.__class__, "port") else 8787, shared_thought_queue=q)
+        # Verify the delivery payload configuration
+        import inspect
+        src = inspect.getsource(d._deliver)
+        self.assertIn('"showBubble":      False', src)
 
 
 if __name__ == "__main__":

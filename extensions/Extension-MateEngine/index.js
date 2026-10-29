@@ -59,7 +59,9 @@ const defaultSettings = {
     autoLipSync: true,
     debugLogging: false,
     inChatPokeEnabled: true,
-    inChatPokeCooldownSec: 180,
+    desktopBubblesEnabled: false,   // Disabled by default so speech bubbles don't stack on desktop
+    autoDismissBubbles: true,       // Auto-dismiss desktop speech bubbles if enabled
+    bubbleDismissTimeoutSec: 5,     // 5 seconds auto-dismissal
 };
 
 // Emotion mapping: SillyTavern classify labels -> MateEngine emotions
@@ -277,19 +279,44 @@ async function stopSpeaking() {
     return sendToBridge('lipsync', { stop: true });
 }
 
+let bubbleDismissTimer = null;
+
 /**
- * Send complete chat message to MateEngine (for speech bubble + lip sync + expression)
+ * Schedule auto-dismissal of desktop bubbles in MateEngine
  */
-async function sendChatMessage(text, characterName = null, emotion = null) {
-    const settings = extension_settings[MODULE_NAME];
+function scheduleBubbleDismiss(delaySeconds = 5) {
+    if (bubbleDismissTimer) clearTimeout(bubbleDismissTimer);
+    bubbleDismissTimer = setTimeout(async () => {
+        try {
+            await sendToBridge('chat', { text: '', showBubble: false });
+        } catch (_) {}
+    }, Math.max(1000, delaySeconds * 1000));
+}
+
+/**
+ * Send complete chat message to MateEngine (for expressions, lip sync, and optional bubble)
+ */
+async function sendChatMessage(text, characterName = null, emotion = null, showBubble = null) {
+    const settings = extension_settings[MODULE_NAME] || {};
+    // Determine whether to show bubble: default false for spontaneous, respect setting otherwise
+    const shouldShowBubble = (showBubble !== null)
+        ? Boolean(showBubble)
+        : (settings.desktopBubblesEnabled === true);
+
     const data = {
         text: text,
         characterName: characterName,
         emotion: emotion ? (EMOTION_MAP[emotion.toLowerCase()] || emotion) : null,
-        triggerLipSync: settings.autoLipSync,  // Use setting instead of hardcoded true
-        showBubble: true
+        triggerLipSync: settings.autoLipSync !== false,
+        showBubble: shouldShowBubble
     };
-    return sendToBridge('chat', data);
+    const result = await sendToBridge('chat', data);
+
+    // If bubble was requested and auto-dismiss is enabled, clear it after timeout
+    if (shouldShowBubble && settings.autoDismissBubbles !== false) {
+        scheduleBubbleDismiss(settings.bubbleDismissTimeoutSec || 5);
+    }
+    return result;
 }
 
 /**
@@ -652,12 +679,22 @@ function createSettingsUI() {
                     
                     <label class="checkbox_label">
                         <input type="checkbox" id="mex_in_chat_poke" />
-                        <span>Autonomous in-chat pokes (Dual-Channel)</span>
+                        <span>Pipe spontaneous thoughts into active chat</span>
                     </label>
-                    
+
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="mex_desktop_bubbles" />
+                        <span>Enable desktop speech bubbles (:8787)</span>
+                    </label>
+
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="mex_auto_dismiss_bubbles" />
+                        <span>Auto-dismiss desktop speech bubbles</span>
+                    </label>
+
                     <label class="text_pole_label">
-                        <span>In-chat poke cooldown (seconds)</span>
-                        <input type="number" id="mex_in_chat_cooldown" class="text_pole" min="30" max="1800" step="10" placeholder="180" />
+                        <span>Bubble dismiss timeout (seconds)</span>
+                        <input type="number" id="mex_dismiss_timeout" class="text_pole" min="2" max="60" step="1" placeholder="5" />
                     </label>
                     
                     <div class="mex-status" id="mex_status">
@@ -704,14 +741,24 @@ function bindSettingsUI() {
         saveSettingsDebounced();
     });
 
-    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled).on('change', function () {
+    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled !== false).on('change', function () {
         settings.inChatPokeEnabled = $(this).prop('checked');
         saveSettingsDebounced();
     });
 
-    $('#mex_in_chat_cooldown').val(settings.inChatPokeCooldownSec || 180).on('change', function () {
+    $('#mex_desktop_bubbles').prop('checked', settings.desktopBubblesEnabled === true).on('change', function () {
+        settings.desktopBubblesEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#mex_auto_dismiss_bubbles').prop('checked', settings.autoDismissBubbles !== false).on('change', function () {
+        settings.autoDismissBubbles = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#mex_dismiss_timeout').val(settings.bubbleDismissTimeoutSec || 5).on('change', function () {
         const val = parseInt($(this).val(), 10);
-        settings.inChatPokeCooldownSec = isNaN(val) ? 180 : Math.max(10, val);
+        settings.bubbleDismissTimeoutSec = isNaN(val) ? 5 : Math.max(1, val);
         saveSettingsDebounced();
     });
 
@@ -751,6 +798,12 @@ jQuery(async () => {
 
     // Subscribe to events
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    if (event_types.CHARACTER_MESSAGE_RENDERED) {
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => { flushPendingPokes(); });
+    }
+    if (event_types.CHAT_CHANGED) {
+        eventSource.on(event_types.CHAT_CHANGED, () => { flushPendingPokes(); });
+    }
 
     // Check initial connection
     setTimeout(async () => {
@@ -800,7 +853,7 @@ function startChatPolling() {
     console.log(`${DEBUG_PREFIX} Started fast chat & spontaneous thought polling`);
 }
 
-let lastInChatPokeTimestamp = 0;
+let pendingInChatPokes = [];
 
 /**
  * Checks whether SillyTavern is currently generating an LLM response.
@@ -813,21 +866,74 @@ function isCurrentlyGenerating() {
 }
 
 /**
- * Delivers an autonomous spontaneous poke into SillyTavern's active chat session
- * as an incoming character message (role: 'assistant' / character turn).
+ * Robustly sanitizes raw thought strings:
+ * - Strips pipe alternatives (picks first non-empty option)
+ * - Strips bracketed system/context tokens ([Context: ...], [Note: ...], etc.)
+ * - Strips character prefix tags ('Alpha:', 'thought:', etc.) and surrounding quotes
+ * - Strips non-BMP characters to prevent box glyphs
+ */
+function cleanSpontaneousText(rawText) {
+    if (!rawText || typeof rawText !== 'string') return '';
+    let text = rawText.trim();
+    // 1. Pick first option if piped
+    if (text.includes('|')) {
+        const parts = text.split('|').map(s => s.trim()).filter(Boolean);
+        if (parts.length > 0) text = parts[0];
+    }
+    // 2. Strip bracketed metadata or prompt tokens
+    text = text.replace(/\[(?:Context|System|Note|Remark|Thinking|State):?[^\]]*\]/gi, '').trim();
+    // 3. Strip common prefixes: 'Alpha:', 'Thought:', quotes
+    text = text.replace(/^(?:Alpha|thought|remark):\s*/i, '').replace(/^["'“”‘’]|["'“”‘’]$/g, '').trim();
+    // 4. Strip non-BMP characters
+    text = text.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '').trim();
+    return text;
+}
+
+/**
+ * Flushes queued spontaneous remarks into SillyTavern chat once generation finishes or chat loads.
+ */
+async function flushPendingPokes() {
+    if (isCurrentlyGenerating()) return;
+    const context = getContext();
+    if (!context || !context.chat || (context.characterId === undefined && !context.groupId)) return;
+
+    while (pendingInChatPokes.length > 0 && !isCurrentlyGenerating()) {
+        const item = pendingInChatPokes.shift();
+        if (item && item.text) {
+            await executeInChatInsertion(item.text, item.charName);
+        }
+    }
+}
+
+/**
+ * Delivers a clean spontaneous thought into SillyTavern's active chat session
+ * as an incoming character message turn without waiting for user input.
  */
 async function deliverInChatPoke(thoughtText, characterName) {
-    if (!thoughtText || typeof thoughtText !== 'string') return;
-
-    // Strict sanitation: ensure NO bracketed system tags or context leaks enter chat history
-    const cleanText = thoughtText.replace(/\[(?:Context|System|Note):?[^\]]*\]/gi, '').trim();
+    const cleanText = cleanSpontaneousText(thoughtText);
     if (!cleanText) return;
 
+    if (isCurrentlyGenerating()) {
+        console.log(`${DEBUG_PREFIX} Generation in progress — queued spontaneous thought for delivery: "${cleanText}"`);
+        pendingInChatPokes.push({ text: cleanText, charName: characterName });
+        return;
+    }
+
+    await executeInChatInsertion(cleanText, characterName);
+}
+
+/**
+ * Directly appends message into SillyTavern active chat array, updates DOM, and saves.
+ */
+async function executeInChatInsertion(cleanText, characterName) {
     try {
         const context = getContext();
         if (!context || !context.chat || !Array.isArray(context.chat)) return;
-        // Require active chat (character or group)
-        if (context.characterId === undefined && !context.groupId) return;
+        if (context.characterId === undefined && !context.groupId) {
+            // Chat not yet loaded; retain in queue
+            pendingInChatPokes.push({ text: cleanText, charName: characterName });
+            return;
+        }
 
         const charName = characterName
             || context.name2
@@ -840,10 +946,12 @@ async function deliverInChatPoke(thoughtText, characterName) {
             is_system: false,
             send_date: new Date().toISOString(),
             mes: cleanText,
-            extra: {},
+            extra: {
+                isSpontaneous: true,
+            },
         };
 
-        // 1. Append message directly to chat session
+        // 1. Append directly to chat session
         context.chat.push(message);
 
         // 2. Render in chat DOM
@@ -872,21 +980,24 @@ async function deliverInChatPoke(thoughtText, characterName) {
             await context.saveChat();
         }
 
-        lastInChatPokeTimestamp = Date.now();
-        console.log(`${DEBUG_PREFIX} \u2713 Autonomous in-chat poke delivered to active chat:`, cleanText);
+        console.log(`${DEBUG_PREFIX} \u2713 Spontaneous remark piped directly into active chat: "${cleanText}"`);
     } catch (e) {
         console.error(`${DEBUG_PREFIX} Failed to deliver in-chat poke:`, e);
     }
 }
 
 /**
- * Pulls queued Spontaneous Thoughts from AnimeVision.py (port 5001)
- * and delivers them via Dual Channels:
- *   Channel A: MateEngine's transient desktop speech bubble (GET :8787).
- *   Channel B: SillyTavern active chat history (as an autonomous character message).
+ * Polls queued Spontaneous Thoughts from AnimeVision.py (port 5001)
+ * and pipes them directly into SillyTavern active chat as character messages.
+ * Prevents desktop bubble stacking by keeping showBubble: false.
  */
 async function processSpontaneousThoughts() {
     try {
+        // Check and flush any queued pokes once LLM generation has finished
+        if (!isCurrentlyGenerating() && pendingInChatPokes.length > 0) {
+            await flushPendingPokes();
+        }
+
         const res = await fetch('http://127.0.0.1:5001/spontaneous_pop');
         if (!res.ok) return;
         const data = await res.json();
@@ -897,54 +1008,35 @@ async function processSpontaneousThoughts() {
             const wasClosed = !lastKnownChatBoxOpen;
             lastKnownChatBoxOpen = data.chat_box_open;
 
-            // If the chat box was just reopened and we had a recently completed response,
-            // refresh MateEngine's speech bubble to ensure user visibility
+            // If the chat box was reopened and user has desktop bubbles enabled, refresh bubble
             if (wasClosed && lastKnownChatBoxOpen && lastDeliveredResponse) {
                 const ageMs = Date.now() - lastDeliveredResponse.timestamp;
                 if (ageMs < 45000) {
-                    console.log(`${DEBUG_PREFIX} Chat box reopened! Re-synchronizing last response to bubble:`, lastDeliveredResponse.text.substring(0, 30));
-                    await sendChatMessage(lastDeliveredResponse.text, lastDeliveredResponse.charName, 'joy');
+                    const settings = extension_settings[MODULE_NAME] || {};
+                    if (settings.desktopBubblesEnabled === true) {
+                        await sendChatMessage(lastDeliveredResponse.text, lastDeliveredResponse.charName, 'joy', true);
+                    }
                 }
             }
         }
 
         if (!data.thought) return;
 
-        let thoughtText = String(data.thought).trim();
-        // Sanitize candidate pipes if any slip through
-        if (thoughtText.includes('|')) {
-            const parts = thoughtText.split('|').map(s => s.trim()).filter(Boolean);
-            if (parts.length > 0) thoughtText = parts[0];
-        }
-
-        // Clean out any bracketed system instruction tokens
-        thoughtText = thoughtText.replace(/\[(?:Context|System|Note):?[^\]]*\]/gi, '').trim();
-        if (!thoughtText) return;
+        const cleanText = cleanSpontaneousText(String(data.thought));
+        if (!cleanText) return;
 
         const context = getContext();
         const characterName = context.characterName || 'Alpha';
 
-        console.log(`${DEBUG_PREFIX} Displaying spontaneous thought in desktop bubble:`, thoughtText);
+        console.log(`${DEBUG_PREFIX} Ingested spontaneous thought from AnimeVision: "${cleanText}"`);
 
-        // 1. Channel A (Ambient Desktop Presence): Push to MateEngine desktop bubble
-        await sendChatMessage(thoughtText, characterName, 'joy');
+        // 1. Channel A: Animate 3D avatar & lip sync without stacking desktop speech bubbles
+        await sendChatMessage(cleanText, characterName, 'joy', false);
 
-        // 2. Channel B (Autonomous In-Chat Poke): Push directly to SillyTavern chat history
+        // 2. Channel B: Pipe ALL spontaneous thoughts directly into SillyTavern active chat
         const settings = extension_settings[MODULE_NAME] || {};
-        const inChatEnabled = settings.inChatPokeEnabled !== false;
-        const cooldownSec = settings.inChatPokeCooldownSec || 180;
-        const now = Date.now();
-        const elapsedMs = now - lastInChatPokeTimestamp;
-
-        if (inChatEnabled && elapsedMs >= cooldownSec * 1000) {
-            // Guard: don't interrupt active AI generations or pending user inputs
-            if (!isCurrentlyGenerating()) {
-                await deliverInChatPoke(thoughtText, characterName);
-            } else {
-                console.log(`${DEBUG_PREFIX} Skipping in-chat poke: generation in progress`);
-            }
-        } else if (inChatEnabled) {
-            console.log(`${DEBUG_PREFIX} In-chat poke throttled (${Math.round((cooldownSec * 1000 - elapsedMs) / 1000)}s remaining)`);
+        if (settings.inChatPokeEnabled !== false) {
+            await deliverInChatPoke(cleanText, characterName);
         }
     } catch (e) {
         // Vision server offline or busy

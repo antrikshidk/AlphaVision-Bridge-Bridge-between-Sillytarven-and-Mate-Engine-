@@ -230,7 +230,7 @@ class Dispatcher:
             "characterName":   _CHARACTER_NAME,
             "emotion":         emotion,
             "triggerLipSync":  True,
-            "showBubble":      True,
+            "showBubble":      False,  # Disable persistent desktop stacking bubbles (dialogue pipes to SillyTavern chat)
             "spontaneous":     True,   # marker so MateEngine can style differently if needed
         }
 
