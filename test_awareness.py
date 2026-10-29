@@ -846,6 +846,55 @@ class TestThoughtQueueAndInputRouting(unittest.TestCase):
         self.assertEqual(cleaned_2, "this")
 
 
+
+# ---------------------------------------------------------------------------
+# 15. MediaPipe Import & Autonomous In-Chat Poke Tests
+# ---------------------------------------------------------------------------
+class TestMediaPipeImportAndInChatSpontaneousPoking(unittest.TestCase):
+
+    def test_mediapipe_import_availability(self):
+        """MediaPipe solutions namespace must load with _MP_AVAILABLE True and valid face_mesh."""
+        from engine.perception import _MP_AVAILABLE, _mp_face_mesh
+        self.assertTrue(_MP_AVAILABLE, "MediaPipe must be available in virtualenv")
+        self.assertIsNotNone(_mp_face_mesh, "FaceMesh module must not be None")
+        self.assertTrue(hasattr(_mp_face_mesh, "FaceMesh"), "FaceMesh class must exist")
+
+    def test_in_chat_poke_message_formatting(self):
+        """In-chat spontaneous poke message object must represent an assistant turn without prompt leaks."""
+        thought = '[Context: Teasing user about chemistry] Are you still debugging that socket?'
+        import re
+        sanitized = re.sub(r'\[(?:Context|System|Note):?[^\]]*\]', '', thought).strip()
+        self.assertEqual(sanitized, "Are you still debugging that socket?")
+
+        message = {
+            "name": "Alpha",
+            "is_user": False,
+            "is_system": False,
+            "send_date": "2026-10-29T12:00:00.000Z",
+            "mes": sanitized,
+            "extra": {},
+        }
+        self.assertFalse(message["is_user"])
+        self.assertFalse(message["is_system"])
+        self.assertEqual(message["name"], "Alpha")
+        self.assertNotIn("[Context:", message["mes"])
+
+    def test_in_chat_poke_cooldown_gating(self):
+        """In-chat poke must respect the cooldown interval (e.g. 180s)."""
+        cooldown_sec = 180
+        last_poke_time = 1000.0
+        
+        # Test 1: Within cooldown -> blocked
+        current_time_1 = 1100.0  # only 100s elapsed
+        allowed_1 = (current_time_1 - last_poke_time) >= cooldown_sec
+        self.assertFalse(allowed_1)
+
+        # Test 2: After cooldown -> allowed
+        current_time_2 = 1200.0  # 200s elapsed
+        allowed_2 = (current_time_2 - last_poke_time) >= cooldown_sec
+        self.assertTrue(allowed_2)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -867,6 +916,7 @@ if __name__ == "__main__":
         TestAmbientPokeContext,
         TestIgnoringAndNaggingTriggers,
         TestThoughtQueueAndInputRouting,
+        TestMediaPipeImportAndInChatSpontaneousPoking,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

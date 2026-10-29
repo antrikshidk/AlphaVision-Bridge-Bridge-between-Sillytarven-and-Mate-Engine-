@@ -37,17 +37,19 @@ logger = logging.getLogger("alphavision.perception")
 # ---------------------------------------------------------------------------
 try:
     import mediapipe as mp
-    _mp_solutions = getattr(mp, "solutions", None)
-    if _mp_solutions is None:
-        raise ImportError("mediapipe stub — solutions namespace missing")
-    _mp_face_mesh = _mp_solutions.face_mesh
-    _mp_drawing   = _mp_solutions.drawing_utils
+    if hasattr(mp, "solutions"):
+        _mp_face_mesh = mp.solutions.face_mesh
+        _mp_drawing = mp.solutions.drawing_utils
+    else:
+        from mediapipe.python.solutions import face_mesh as _mp_face_mesh
+        from mediapipe.python.solutions import drawing_utils as _mp_drawing
     _MP_AVAILABLE = True
-except (ImportError, AttributeError):
+except Exception as e:
     _MP_AVAILABLE = False
     _mp_face_mesh = None   # type: ignore
     _mp_drawing   = None   # type: ignore
-    logger.warning("[PERCEPTION] mediapipe not available — falling back to Haar-cascade presence detection.")
+    logger.error(f"[PERCEPTION] MediaPipe import failed: {e}", exc_info=True)
+    logger.warning("[PERCEPTION] Falling back to Haar-cascade presence detection.")
 
 try:
     import win32gui

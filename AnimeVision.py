@@ -442,7 +442,7 @@ def pop_spontaneous_thought():
 
             app_logger.info(f"[QUEUE FLUSHED] Sent spontaneous thought to desktop bubble: '{clean}'")
             set_last_ambient_poke(clean, "spontaneous_pop")
-            return jsonify({"thought": clean, "chat_box_open": chat_box_is_open})
+            return jsonify({"thought": clean, "chat_box_open": chat_box_is_open, "timestamp": now})
 
     return jsonify({"thought": None, "chat_box_open": chat_box_is_open})
 

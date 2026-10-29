@@ -13,6 +13,9 @@ import {
     setExtensionPrompt,
     extension_prompt_types,
     extension_prompt_roles,
+    addOneMessage,
+    saveChatConditional,
+    isGenerating,
 } from '../../../../script.js';
 
 // Try to import slash command registration - different locations in different ST versions
@@ -55,6 +58,8 @@ const defaultSettings = {
     autoSendExpressions: true,
     autoLipSync: true,
     debugLogging: false,
+    inChatPokeEnabled: true,
+    inChatPokeCooldownSec: 180,
 };
 
 // Emotion mapping: SillyTavern classify labels -> MateEngine emotions
@@ -645,6 +650,16 @@ function createSettingsUI() {
                         <span>Debug logging</span>
                     </label>
                     
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="mex_in_chat_poke" />
+                        <span>Autonomous in-chat pokes (Dual-Channel)</span>
+                    </label>
+                    
+                    <label class="text_pole_label">
+                        <span>In-chat poke cooldown (seconds)</span>
+                        <input type="number" id="mex_in_chat_cooldown" class="text_pole" min="30" max="1800" step="10" placeholder="180" />
+                    </label>
+                    
                     <div class="mex-status" id="mex_status">
                         <span class="mex-status-indicator"></span>
                         <span class="mex-status-text">Checking...</span>
@@ -686,6 +701,17 @@ function bindSettingsUI() {
 
     $('#mex_debug').prop('checked', settings.debugLogging).on('change', function () {
         settings.debugLogging = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled).on('change', function () {
+        settings.inChatPokeEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#mex_in_chat_cooldown').val(settings.inChatPokeCooldownSec || 180).on('change', function () {
+        const val = parseInt($(this).val(), 10);
+        settings.inChatPokeCooldownSec = isNaN(val) ? 180 : Math.max(10, val);
         saveSettingsDebounced();
     });
 
@@ -774,9 +800,90 @@ function startChatPolling() {
     console.log(`${DEBUG_PREFIX} Started fast chat & spontaneous thought polling`);
 }
 
+let lastInChatPokeTimestamp = 0;
+
+/**
+ * Checks whether SillyTavern is currently generating an LLM response.
+ */
+function isCurrentlyGenerating() {
+    try {
+        if (typeof isGenerating === 'function') return isGenerating();
+    } catch (_) {}
+    return false;
+}
+
+/**
+ * Delivers an autonomous spontaneous poke into SillyTavern's active chat session
+ * as an incoming character message (role: 'assistant' / character turn).
+ */
+async function deliverInChatPoke(thoughtText, characterName) {
+    if (!thoughtText || typeof thoughtText !== 'string') return;
+
+    // Strict sanitation: ensure NO bracketed system tags or context leaks enter chat history
+    const cleanText = thoughtText.replace(/\[(?:Context|System|Note):?[^\]]*\]/gi, '').trim();
+    if (!cleanText) return;
+
+    try {
+        const context = getContext();
+        if (!context || !context.chat || !Array.isArray(context.chat)) return;
+        // Require active chat (character or group)
+        if (context.characterId === undefined && !context.groupId) return;
+
+        const charName = characterName
+            || context.name2
+            || (context.characters && context.characterId !== undefined ? context.characters[context.characterId]?.name : null)
+            || 'Alpha';
+
+        const message = {
+            name: charName,
+            is_user: false,
+            is_system: false,
+            send_date: new Date().toISOString(),
+            mes: cleanText,
+            extra: {},
+        };
+
+        // 1. Append message directly to chat session
+        context.chat.push(message);
+
+        // 2. Render in chat DOM
+        if (typeof addOneMessage === 'function') {
+            addOneMessage(message);
+        } else if (typeof context.addOneMessage === 'function') {
+            context.addOneMessage(message);
+        }
+
+        const messageId = context.chat.length - 1;
+
+        // 3. Emit SillyTavern character message events
+        if (eventSource && eventSource.emit && event_types) {
+            try {
+                await eventSource.emit(event_types.MESSAGE_RECEIVED, messageId);
+                await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, messageId);
+            } catch (err) {
+                console.warn(`${DEBUG_PREFIX} Error emitting in-chat poke events:`, err);
+            }
+        }
+
+        // 4. Save updated chat history
+        if (typeof saveChatConditional === 'function') {
+            await saveChatConditional();
+        } else if (typeof context.saveChat === 'function') {
+            await context.saveChat();
+        }
+
+        lastInChatPokeTimestamp = Date.now();
+        console.log(`${DEBUG_PREFIX} \u2713 Autonomous in-chat poke delivered to active chat:`, cleanText);
+    } catch (e) {
+        console.error(`${DEBUG_PREFIX} Failed to deliver in-chat poke:`, e);
+    }
+}
+
 /**
  * Pulls queued Spontaneous Thoughts from AnimeVision.py (port 5001)
- * and displays them purely in MateEngine's transient desktop bubble (zero chat history pollution).
+ * and delivers them via Dual Channels:
+ *   Channel A: MateEngine's transient desktop speech bubble (GET :8787).
+ *   Channel B: SillyTavern active chat history (as an autonomous character message).
  */
 async function processSpontaneousThoughts() {
     try {
@@ -810,13 +917,35 @@ async function processSpontaneousThoughts() {
             if (parts.length > 0) thoughtText = parts[0];
         }
 
+        // Clean out any bracketed system instruction tokens
+        thoughtText = thoughtText.replace(/\[(?:Context|System|Note):?[^\]]*\]/gi, '').trim();
+        if (!thoughtText) return;
+
         const context = getContext();
         const characterName = context.characterName || 'Alpha';
 
         console.log(`${DEBUG_PREFIX} Displaying spontaneous thought in desktop bubble:`, thoughtText);
 
-        // Push exclusively to MateEngine desktop bubble (do NOT pollute persistent SillyTavern chat history)
+        // 1. Channel A (Ambient Desktop Presence): Push to MateEngine desktop bubble
         await sendChatMessage(thoughtText, characterName, 'joy');
+
+        // 2. Channel B (Autonomous In-Chat Poke): Push directly to SillyTavern chat history
+        const settings = extension_settings[MODULE_NAME] || {};
+        const inChatEnabled = settings.inChatPokeEnabled !== false;
+        const cooldownSec = settings.inChatPokeCooldownSec || 180;
+        const now = Date.now();
+        const elapsedMs = now - lastInChatPokeTimestamp;
+
+        if (inChatEnabled && elapsedMs >= cooldownSec * 1000) {
+            // Guard: don't interrupt active AI generations or pending user inputs
+            if (!isCurrentlyGenerating()) {
+                await deliverInChatPoke(thoughtText, characterName);
+            } else {
+                console.log(`${DEBUG_PREFIX} Skipping in-chat poke: generation in progress`);
+            }
+        } else if (inChatEnabled) {
+            console.log(`${DEBUG_PREFIX} In-chat poke throttled (${Math.round((cooldownSec * 1000 - elapsedMs) / 1000)}s remaining)`);
+        }
     } catch (e) {
         // Vision server offline or busy
     }
@@ -857,16 +986,25 @@ async function processPendingChats() {
                     if (pokeRes.ok) {
                         const pokeData = await pokeRes.json();
                         if (pokeData && pokeData.valid && pokeData.poke && pokeData.poke.text) {
-                            console.log(`${DEBUG_PREFIX} Ambient poke context active:`, pokeData.poke.text);
-                            ambientContextPrompt = `[Context: You recently teased or spoke to the user with: "${pokeData.poke.text}". The user is now responding to you.]`;
-                            if (typeof setExtensionPrompt === 'function') {
-                                const promptType = (typeof extension_prompt_types !== 'undefined' && extension_prompt_types.IN_PROMPT !== undefined)
-                                    ? extension_prompt_types.IN_PROMPT
-                                    : 0;
-                                const promptRole = (typeof extension_prompt_roles !== 'undefined' && extension_prompt_roles.SYSTEM !== undefined)
-                                    ? extension_prompt_roles.SYSTEM
-                                    : 0;
-                                setExtensionPrompt('MateEngine_AmbientContext', ambientContextPrompt, promptType, 0, false, promptRole);
+                            const lastChatMsg = context.chat && context.chat.length > 0 ? context.chat[context.chat.length - 1] : null;
+                            const pokeTextNorm = pokeData.poke.text.trim().toLowerCase();
+                            const lastChatNorm = lastChatMsg ? String(lastChatMsg.mes || '').trim().toLowerCase() : '';
+
+                            // Only inject ephemeral prompt if not already in chat history
+                            if (!lastChatNorm.includes(pokeTextNorm)) {
+                                console.log(`${DEBUG_PREFIX} Ambient poke context active:`, pokeData.poke.text);
+                                ambientContextPrompt = `[Context: You recently teased or spoke to the user with: "${pokeData.poke.text}". The user is now responding to you.]`;
+                                if (typeof setExtensionPrompt === 'function') {
+                                    const promptType = (typeof extension_prompt_types !== 'undefined' && extension_prompt_types.IN_PROMPT !== undefined)
+                                        ? extension_prompt_types.IN_PROMPT
+                                        : 0;
+                                    const promptRole = (typeof extension_prompt_roles !== 'undefined' && extension_prompt_roles.SYSTEM !== undefined)
+                                        ? extension_prompt_roles.SYSTEM
+                                        : 0;
+                                    setExtensionPrompt('MateEngine_AmbientContext', ambientContextPrompt, promptType, 0, false, promptRole);
+                                }
+                            } else {
+                                console.log(`${DEBUG_PREFIX} Ambient poke already in chat history — skipping redundant prompt injection.`);
                             }
                         }
                     }
