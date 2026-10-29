@@ -97,6 +97,30 @@ _WINDOW_TAGS: dict[str, str] = {
     "mathematica": "physics",
     "matlab": "physics",
 
+    # 2c. PDF, Books & Document Reading (must precede generic browsers)
+    "book.pdf": "reading",
+    ".pdf": "reading",
+    "pdf": "reading",
+    "adobe": "reading",
+    "acrobat": "reading",
+    "foxit": "reading",
+    "sumatra": "reading",
+    "reader": "reading",
+    "kindle": "reading",
+    "epub": "reading",
+
+    # 2d. Math & Academic Study (must precede generic browsers)
+    "maths": "study",
+    "math": "study",
+    "calculus": "study",
+    "algebra": "study",
+    "geometry": "study",
+    "cbse": "study",
+    "ncert": "study",
+    "chemistry": "study",
+    "biology": "study",
+    "khan academy": "study",
+
     # 3. Gaming
     "valorant": "gaming",
     "steam": "gaming",
@@ -552,6 +576,43 @@ def _detect_fatigue_blink(eye_landmarks, prev_ear: float) -> Tuple[bool, float]:
 
 
 # ---------------------------------------------------------------------------
+# Low-Light Night Contrast Enhancement (CLAHE + Gamma Boost)
+# ---------------------------------------------------------------------------
+def enhance_low_light(frame: np.ndarray, brightness_thresh: float = 95.0) -> np.ndarray:
+    """
+    If average frame brightness is low (nighttime or dim indoor lighting),
+    applies CLAHE (Contrast Limited Adaptive Histogram Equalization) on the L-channel
+    in LAB color space and a gentle gamma boost (0.75) for deep shadows so handheld
+    objects, book titles, and formulas remain sharp and legible instead of dark blur.
+    Returns the original frame untouched if brightness exceeds brightness_thresh.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_val = float(np.mean(gray))
+        if mean_val >= brightness_thresh:
+            return frame
+
+        # 1. CLAHE on L-channel in LAB space to enhance local contrast without hue shifts
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l_channel)
+        enhanced = cv2.cvtColor(cv2.merge((cl, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+
+        # 2. Light gamma curve boost if scene is particularly dark (< 60 mean)
+        if mean_val < 60.0:
+            table = np.array([((i / 255.0) ** 0.75) * 255 for i in range(256)]).astype("uint8")
+            enhanced = cv2.LUT(enhanced, table)
+
+        return enhanced
+    except Exception as exc:
+        logger.debug("[PERCEPTION] enhance_low_light fallback: %s", exc)
+        return frame
+
+
+# ---------------------------------------------------------------------------
 # Hardware Webcam Worker (Isolated Non-blocking Daemon Thread)
 # ---------------------------------------------------------------------------
 class CameraWorker(threading.Thread):
@@ -663,12 +724,24 @@ class CameraWorker(threading.Thread):
         with self._frame_lock:
             return self._latest_frame.copy() if self._latest_frame is not None else None
 
-    def capture_frame_blob(self, width: int = 320) -> Optional[bytes]:
-        """Thread-safe snapshot capture as downscaled JPEG bytes."""
+    def capture_frame_blob(
+        self,
+        max_dimension: int = 512,
+        quality: int = 75,
+        enhance_lighting: bool = True,
+        width: Optional[int] = None,
+    ) -> Optional[bytes]:
+        """Thread-safe snapshot capture as downscaled JPEG bytes with night contrast boost."""
         frame = self.get_latest_frame()
         if frame is None:
             return None
-        return PerceptionEngine.capture_frame_blob(frame, width=width)
+        return PerceptionEngine.capture_frame_blob(
+            frame,
+            max_dimension=max_dimension,
+            quality=quality,
+            enhance_lighting=enhance_lighting,
+            width=width,
+        )
 
     def stop(self):
         self._stop_event.set()
@@ -1014,16 +1087,31 @@ class PerceptionEngine:
     # Snapshot utility: capture one downscaled JPEG for multimodal API
     # ------------------------------------------------------------------
     @staticmethod
-    def capture_frame_blob(frame: np.ndarray, width: int = 320) -> Optional[bytes]:
+    def capture_frame_blob(
+        frame: np.ndarray,
+        max_dimension: int = 512,
+        quality: int = 75,
+        enhance_lighting: bool = True,
+        width: Optional[int] = None,
+    ) -> Optional[bytes]:
         """
-        Downscale a BGR frame and return JPEG bytes (quality=60).
-        Never called continuously — only on major state transitions.
+        Downscale a BGR frame (max 512px on longest side or 640x480) with JPEG quality=75,
+        applying CLAHE / low-light contrast enhancement if scene lighting is dark.
         """
+        if frame is None or frame.size == 0:
+            return None
         try:
+            target_dim = width if width is not None else max_dimension
+            if enhance_lighting:
+                frame = enhance_low_light(frame)
             h, w = frame.shape[:2]
-            scale   = width / w
-            resized = cv2.resize(frame, (width, int(h * scale)))
-            ret, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            max_side = max(h, w)
+            if max_side > target_dim:
+                scale = float(target_dim) / float(max_side)
+                resized = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            else:
+                resized = frame
+            ret, buf = cv2.imencode(".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
             if ret:
                 return buf.tobytes()
         except Exception as exc:

@@ -960,6 +960,119 @@ class TestVisionGatingAndBubbleDismissal(unittest.TestCase):
         self.assertIn('"show_bubble": True', src)
 
 
+
+# ---------------------------------------------------------------------------
+# 17. Low-Light Enhancement & High-Res Vision Tests
+# ---------------------------------------------------------------------------
+class TestLowLightAndHighResVision(unittest.TestCase):
+
+    def test_enhance_low_light_amplifies_dim_frame(self):
+        """Dim frames (<60 mean) must be boosted via CLAHE and gamma curve."""
+        import numpy as np
+        from engine.perception import enhance_low_light
+
+        dark_frame = np.full((120, 160, 3), 30, dtype=np.uint8)
+        enhanced = enhance_low_light(dark_frame)
+        self.assertGreater(float(enhanced.mean()), 50.0)
+
+    def test_enhance_low_light_preserves_bright_frame(self):
+        """Bright frames (>=95 mean) must pass through untouched."""
+        import numpy as np
+        from engine.perception import enhance_low_light
+
+        bright_frame = np.full((120, 160, 3), 140, dtype=np.uint8)
+        enhanced = enhance_low_light(bright_frame)
+        self.assertTrue(np.array_equal(bright_frame, enhanced))
+
+    def test_perception_capture_frame_blob_parameters(self):
+        """capture_frame_blob must accept max_dimension=512, quality=75 and return valid blob."""
+        import numpy as np
+        from engine.perception import PerceptionEngine
+
+        dummy_frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+        blob = PerceptionEngine.capture_frame_blob(dummy_frame, max_dimension=512, quality=75, enhance_lighting=True)
+        self.assertIsNotNone(blob)
+        self.assertIsInstance(blob, bytes)
+        self.assertGreater(len(blob), 0)
+
+    def test_reading_and_study_tags(self):
+        """PDF documents and CBSE/Maths study windows must tag accurately."""
+        from engine.perception import _tag_window
+
+        self.assertEqual(_tag_window("book.pdf - SumatraPDF"), "reading")
+        self.assertEqual(_tag_window("Calculus-Chapter3.pdf - Adobe Acrobat Reader"), "reading")
+        self.assertEqual(_tag_window("CBSE Class 12 Maths - Brave"), "study")
+        self.assertEqual(_tag_window("Organic Chemistry Notes - Edge"), "study")
+
+    def test_holding_and_book_vision_keywords(self):
+        """Holding objects, books, and notes must trigger vision requested."""
+        from AnimeVision import is_vision_requested
+
+        self.assertTrue(is_vision_requested("Look at what I am holding in my hand"))
+        self.assertTrue(is_vision_requested("Can you read this book title?"))
+        self.assertTrue(is_vision_requested("Check these notes on physics"))
+        self.assertTrue(is_vision_requested("Please solve this formula on paper"))
+
+
+# ---------------------------------------------------------------------------
+# 18. Anti-Sleep-Nag & Activity Precedence Tests
+# ---------------------------------------------------------------------------
+class TestAntiSleepNagAndPrecedence(unittest.TestCase):
+
+    def test_sleep_comment_cooldown_rejection(self):
+        """Sleep tropes within SLEEP_COMMENT_COOLDOWN (35 mins) must be suppressed."""
+        from engine.brain import BrainEngine, PerceptionSnapshot, SLEEP_COMMENT_COOLDOWN
+
+        snap_q = queue.Queue()
+        mock_model = MagicMock()
+        brain = BrainEngine(snap_q, MagicMock(), mock_model)
+
+        # Simulate sleep remark just fired
+        brain._state.last_sleep_comment_timestamp = time.time() - 300.0  # 5 mins ago (within 35m cooldown)
+
+        mock_resp = MagicMock()
+        mock_resp.text = "You look like a walking zombie, Antriksh. Go to bed."
+        mock_model.generate_content.return_value = mock_resp
+
+        snap = PerceptionSnapshot(presence=True, active_window="book.pdf - SumatraPDF", idle_seconds=10.0)
+        remark = brain._generate_remark("ambient_general", snap)
+
+        # Because recovery prompt also returns zombie, it must be suppressed to None
+        self.assertIsNone(remark)
+
+    def test_active_night_user_retains_focused_state(self):
+        """Active user late at night (idle < 120s) must retain 'focused' and not hard-lock 'sleep_deprived'."""
+        from engine.brain import BrainEngine, PerceptionSnapshot
+
+        snap_q = queue.Queue()
+        brain = BrainEngine(snap_q, MagicMock(), MagicMock())
+        # Late night snap (hour 23), but active (idle 5 seconds)
+        snap = PerceptionSnapshot(
+            presence=True,
+            active_window="Maths-Matrices.pdf - Brave",
+            idle_seconds=5.0,
+            hour=23,
+        )
+        brain._process_snapshot(snap)
+        self.assertEqual(brain._state.user_state, "focused")
+
+    def test_study_tag_takes_precedence_over_generic_night(self):
+        """Specific activity tag (study, reading, physics) must precede generic late_night."""
+        from engine.brain import BrainEngine, PerceptionSnapshot
+
+        snap_q = queue.Queue()
+        brain = BrainEngine(snap_q, MagicMock(), MagicMock())
+        snap = PerceptionSnapshot(
+            presence=True,
+            active_window="book.pdf - SumatraPDF",
+            idle_seconds=10.0,
+            hour=1,  # 1 AM
+        )
+        brain._state.activity_tag = "reading"
+        key = brain._select_ambient_key(snap)
+        self.assertEqual(key, "ambient_reading")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -983,6 +1096,8 @@ if __name__ == "__main__":
         TestThoughtQueueAndInputRouting,
         TestMediaPipeImportAndInChatSpontaneousPoking,
         TestVisionGatingAndBubbleDismissal,
+        TestLowLightAndHighResVision,
+        TestAntiSleepNagAndPrecedence,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

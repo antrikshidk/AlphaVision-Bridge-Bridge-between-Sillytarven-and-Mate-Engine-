@@ -35,7 +35,7 @@ logger = logging.getLogger("alphavision.dispatcher")
 # ---------------------------------------------------------------------------
 # Delivery constants
 # ---------------------------------------------------------------------------
-_MATEENGINE_TIMEOUT = 2.5      # seconds before we give up on the HTTP push
+_MATEENGINE_TIMEOUT = 5.0      # seconds before we give up on the HTTP push
 _RETRY_DELAY        = 1.5      # seconds before a single retry on network err
 _CHARACTER_NAME     = "Alpha"
 _DEFAULT_EMOTION    = "joy"
@@ -260,13 +260,13 @@ class Dispatcher:
             r = requests.post(url, json=payload, timeout=_MATEENGINE_TIMEOUT)
             return r.status_code < 400
         except requests.exceptions.ConnectionError:
-            logger.debug("[DISPATCHER] Connection refused on %s", url)
+            logger.warning("[DISPATCHER] Connection refused on %s (MateEngine not running or port closed)", url)
             return False
         except requests.exceptions.Timeout:
-            logger.debug("[DISPATCHER] Timeout on %s", url)
+            logger.warning("[DISPATCHER] Timeout on %s (>%.1fs)", url, _MATEENGINE_TIMEOUT)
             return False
         except Exception as exc:
-            logger.debug("[DISPATCHER] HTTP error on %s: %s", url, exc)
+            logger.warning("[DISPATCHER] HTTP error on %s: %s", url, exc)
             return False
 
     # ------------------------------------------------------------------

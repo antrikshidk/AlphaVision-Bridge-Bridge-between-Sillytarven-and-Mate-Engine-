@@ -50,6 +50,7 @@ from engine.perception import (
     detect_opaque_input_box,
     SafeScreenGrabber,
     capture_screen_gdi,
+    enhance_low_light,
 )
 from engine.brain import (
     BrainEngine,
@@ -178,7 +179,9 @@ _mateengine_send_lock = threading.Lock()
 VISION_KEYWORDS = (
     'screen', 'look', 'see', 'webcam', 'camera', 'type bar', 'reading', 'watching',
     'what is on', "what's on", 'window', 'app', 'tabs', 'wearing', 'shirt',
-    'room', 'desk', 'face', 'expression', 'glance', 'can you see', 'look at'
+    'room', 'desk', 'face', 'expression', 'glance', 'can you see', 'look at',
+    'holding', 'hold up', 'show', 'showing', 'book', 'notes', 'read this',
+    'check this', 'what is this', 'solve this', 'paper', 'solve', 'formula'
 )
 
 def is_vision_requested(message: str) -> bool:
@@ -330,17 +333,31 @@ def live_sensor_and_cache_worker():
 
                     if cam_frame is not None:
                         try:
-                            cam_small = cv2.resize(cam_frame, (384, 288))
-                            ret, buf = cv2.imencode('.jpg', cam_small, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                            # Apply low-light enhancement (CLAHE + gamma boost)
+                            cam_enh = enhance_low_light(cam_frame)
+                            ch, cw = cam_enh.shape[:2]
+                            c_max = 512
+                            if max(ch, cw) > c_max:
+                                c_scale = c_max / float(max(ch, cw))
+                                cam_small = cv2.resize(cam_enh, (int(cw * c_scale), int(ch * c_scale)), interpolation=cv2.INTER_AREA)
+                            else:
+                                cam_small = cam_enh
+                            ret, buf = cv2.imencode('.jpg', cam_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
                             if ret:
                                 blobs.append({"mime_type": "image/jpeg", "data": buf.tobytes()})
                         except Exception as cam_err:
                             app_logger.debug(f"[CACHE CAM ERR] {cam_err}")
 
-                    # 2. Desktop screen snapshot (downscaled to 512x288 quality 50 for minimal upload latency)
+                    # 2. Desktop screen snapshot (downscaled to max 512px quality 75 for sharp clarity)
                     try:
-                        screen_small = cv2.resize(screen_bgr, (512, 288))
-                        ret2, buf2 = cv2.imencode('.jpg', screen_small, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                        sh, sw = screen_bgr.shape[:2]
+                        s_max = 512
+                        if max(sh, sw) > s_max:
+                            s_scale = s_max / float(max(sh, sw))
+                            screen_small = cv2.resize(screen_bgr, (int(sw * s_scale), int(sh * s_scale)), interpolation=cv2.INTER_AREA)
+                        else:
+                            screen_small = screen_bgr
+                        ret2, buf2 = cv2.imencode('.jpg', screen_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
                         if ret2:
                             blobs.append({"mime_type": "image/jpeg", "data": buf2.tobytes()})
                     except Exception as scr_err:
@@ -356,7 +373,38 @@ def live_sensor_and_cache_worker():
         time.sleep(0.15)
 
 
-def get_cached_visuals():
+def get_cached_visuals(force_fresh: bool = False):
+    """
+    Returns cached JPEG frame blobs (webcam + screen).
+    If force_fresh=True, immediately queries the latest hardware camera frame
+    and desktop screen snapshot with low-light enhancement (CLAHE + gamma boost)
+    at quality=75, guaranteeing crisp legibility when user asks vision questions.
+    """
+    if force_fresh:
+        try:
+            fresh_blobs = []
+            if _awareness_perception is not None:
+                blob = _awareness_perception.capture_frame_blob(max_dimension=512, quality=75, enhance_lighting=True)
+                if blob:
+                    fresh_blobs.append(blob)
+
+            scr_bgr = capture_screen_gdi()
+            if scr_bgr is not None:
+                sh, sw = scr_bgr.shape[:2]
+                s_max = 512
+                if max(sh, sw) > s_max:
+                    s_scale = s_max / float(max(sh, sw))
+                    scr_small = cv2.resize(scr_bgr, (int(sw * s_scale), int(sh * s_scale)), interpolation=cv2.INTER_AREA)
+                else:
+                    scr_small = scr_bgr
+                ret_s, buf_s = cv2.imencode('.jpg', scr_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                if ret_s:
+                    fresh_blobs.append({"mime_type": "image/jpeg", "data": buf_s.tobytes()})
+            if fresh_blobs:
+                return fresh_blobs
+        except Exception as fresh_err:
+            app_logger.debug(f"[FRESH VISUAL ERR] {fresh_err}")
+
     try:
         with visual_cache_lock:
             return list(cached_visual_blobs)
@@ -644,7 +692,7 @@ def universal_chat_bridge(path=""):
 
         # Vision Gating: Only attach heavy multi-modal visual frames if user explicitly requested vision
         needs_vision = is_vision_requested(user_msg)
-        visuals = get_cached_visuals() if needs_vision else []
+        visuals = get_cached_visuals(force_fresh=True) if needs_vision else []
         gemini_payload = visuals + [user_content_str] if visuals else [user_content_str]
 
         answer = None

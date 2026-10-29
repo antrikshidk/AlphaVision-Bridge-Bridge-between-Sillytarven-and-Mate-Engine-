@@ -58,7 +58,7 @@ const defaultSettings = {
     autoSendExpressions: true,
     autoLipSync: true,
     debugLogging: false,
-    inChatPokeEnabled: true,
+    inChatPokeEnabled: false,       // Default false: ambient pokes remain transient in desktop bubble & MateEngine
     desktopBubblesEnabled: false,   // Disabled by default so speech bubbles don't stack on desktop
     autoDismissBubbles: true,       // Auto-dismiss desktop speech bubbles if enabled
     bubbleDismissTimeoutSec: 5,     // 5 seconds auto-dismissal
@@ -746,7 +746,7 @@ function bindSettingsUI() {
         saveSettingsDebounced();
     });
 
-    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled !== false).on('change', function () {
+    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled === true).on('change', function () {
         settings.inChatPokeEnabled = $(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -1040,7 +1040,7 @@ async function processSpontaneousThoughts() {
 
         // 2. Channel B: Pipe ALL spontaneous thoughts directly into SillyTavern active chat
         const settings = extension_settings[MODULE_NAME] || {};
-        if (settings.inChatPokeEnabled !== false) {
+        if (settings.inChatPokeEnabled === true) {
             await deliverInChatPoke(cleanText, characterName);
         }
     } catch (e) {

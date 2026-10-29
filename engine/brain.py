@@ -30,7 +30,7 @@ from typing import Optional, List, Dict, Any
 
 import google.generativeai as genai
 
-from engine.perception import PerceptionSnapshot, _WINDOW_TAGS, _tag_window, tag_window
+from engine.perception import PerceptionSnapshot, _WINDOW_TAGS, _tag_window, tag_window, enhance_low_light
 
 logger = logging.getLogger("alphavision.brain")
 
@@ -44,6 +44,13 @@ MIN_SPONTANEOUS_INTERVAL  = 5 * 60     # 5 min absolute floor
 MAX_SPONTANEOUS_INTERVAL  = 10 * 60    # 10 min normal ceiling
 DRAMA_COOLDOWN            = 90         # seconds; after a dramatic event allow quicker remark
 EVAL_TICK                 = 30         # how often the cognitive loop ticks (seconds)
+SLEEP_COMMENT_COOLDOWN    = 35 * 60    # 35 min minimum between sleep/bed nagging remarks
+SLEEP_KEYWORDS = (
+    "sleep", "bed", "zombie", "tired", "rest", "nap", "exhausted",
+    "pillow", "yawn", "sleepy", "go to sleep", "go offline",
+    "sleep-deprived", "sleep deprived", "goodnight", "nighty",
+    "crash", "pass out"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +177,7 @@ class InternalState:
     session_start: float         = 0.0
     last_chat_timestamp: float   = 0.0           # When user last opened/chatted in companion chat
     last_active_timestamp: float = 0.0           # When user was last actively using desktop
+    last_sleep_comment_timestamp: float = 0.0     # When a sleep/bed remark last fired (rate-limited to 35m)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -184,9 +192,16 @@ class InternalState:
 # Persona prompt templates (lean & fast for <800ms Flash Lite roundtrips)
 # ---------------------------------------------------------------------------
 _PERSONA_HEADER = (
-    "You are Alpha, a sharp-eyed desktop anime companion with dry wit sitting on Antriksh's desktop. "
-    "Observe what he is doing and make ONE short, candid remark (max 15 words) glancing over his shoulder. "
-    "Never sound like an assistant. No help offers. No emojis. Output ONLY the spoken sentence.\n\n"
+    "You are Alpha, a sharp-eyed, observant desktop anime companion with dry wit sitting on Antriksh's desktop.\n"
+    "Observe what he is doing and make ONE short, candid remark (max 15 words) glancing over his shoulder.\n"
+    "OBSERVATION PRIORITIES:\n"
+    "  1. The specific window title, document, or app: remark on what he's reading (e.g. PDF), studying (math/physics), coding, or watching.\n"
+    "  2. Visible physical actions: posture, holding up books/items to camera, facial expressions, deep concentration.\n"
+    "  3. Banter & Wit: playful teasing, curious observations, or witty commentary rather than defaulting to nagging about sleep.\n"
+    "STRICT CONSTRAINTS:\n"
+    "  - Never sound like an assistant or customer service. No help offers ('How can I help?').\n"
+    "  - Do NOT default to nagging about sleep, telling him to go to bed, or calling him a zombie.\n"
+    "  - No emojis. Output ONLY the single spoken sentence.\n\n"
 )
 
 _SITUATION_PROMPTS: Dict[str, str] = {
@@ -199,19 +214,20 @@ _SITUATION_PROMPTS: Dict[str, str] = {
         "One quick offhand comment. Don't make a big deal of it."
     ),
     "late_night_coding": (
-        "It is {hour}:00 and Antriksh is still writing code. "
-        "Comment on his questionable life choices — wry, not preachy."
+        "It is {hour}:00 and Antriksh is writing code in '{active_window}'. "
+        "Make a clever, witty companion remark about his coding focus at this quiet hour."
     ),
     "late_night_gaming": (
-        "It is {hour}:00 and Antriksh is gaming. Say something about his sleep schedule, dryly."
+        "It is {hour}:00 and Antriksh is gaming in '{active_window}'. "
+        "Make a playful remark teasing his gameplay or late-night gaming focus."
     ),
     "late_night_browsing": (
-        "It is past midnight and Antriksh is browsing the web. "
-        "A single sardonic observation."
+        "It is {hour}:00 and Antriksh is working on '{active_window}'. "
+        "Make a sharp, observational comment about what he is browsing or reading."
     ),
     "fatigue_cue": (
-        "Antriksh looks tired — eyes heavy, probably rubbing his face. "
-        "Say something brief, a little concerned but not saccharine."
+        "Antriksh rubbed his eyes or paused while working on '{active_window}'. "
+        "Make a brief, witty observation about his concentration without nagging him to sleep."
     ),
     "long_idle": (
         "Antriksh has been idle for {idle_min:.0f} minutes but the screen is on. "
@@ -222,19 +238,27 @@ _SITUATION_PROMPTS: Dict[str, str] = {
         "One casual, observational comment about the context switch."
     ),
     "ambient_coding": (
-        "Antriksh has been coding for a while. "
-        "A wry ambient observation — something a companion might mutter."
+        "Antriksh is coding in '{active_window}'. "
+        "Make a dry, clever companion observation about his programming workflow."
     ),
     "ambient_gaming": (
-        "Antriksh is gaming. A short playful or teasing remark."
+        "Antriksh is gaming in '{active_window}'. A short playful or teasing remark."
     ),
     "ambient_physics": (
-        "Antriksh is studying physics or solving science formulas. "
+        "Antriksh is studying physics or solving science formulas in '{active_window}'. "
         "Make one playful, teasing companion remark about physics and his big brain."
+    ),
+    "ambient_reading": (
+        "Antriksh is reading a document or PDF ('{active_window}'). "
+        "Make a witty, curious remark about the reading material or how intently he is staring at the page."
+    ),
+    "ambient_study": (
+        "Antriksh is studying or solving formulas in '{active_window}'. "
+        "Make a sharp, playful companion comment about his study session or academic grind."
     ),
     "ignoring_coding": (
         "Antriksh has been staring at code for {ignoring_min:.0f} minutes without talking to you or opening chat. "
-        "Make a dry, nagging poke telling him to take a break and talk to you."
+        "Make a dry, teasing poke telling him to take a break and talk to you."
     ),
     "ignoring_browsing": (
         "Antriksh has been browsing the web for {ignoring_min:.0f} minutes without talking to you. "
@@ -243,6 +267,10 @@ _SITUATION_PROMPTS: Dict[str, str] = {
     "ignoring_physics": (
         "Antriksh has been studying physics equations for {ignoring_min:.0f} minutes without talking to you. "
         "Tease him playfully about his physics obsession and demand he take a break to talk to you."
+    ),
+    "ignoring_study": (
+        "Antriksh has been deep in study material in '{active_window}' for {ignoring_min:.0f} minutes without talking to you. "
+        "Playfully demand that he take a quick breather to talk to you."
     ),
     "ignoring_gaming": (
         "Antriksh has been gaming for {ignoring_min:.0f} minutes completely ignoring you. "
@@ -253,7 +281,7 @@ _SITUATION_PROMPTS: Dict[str, str] = {
         "Make an attention-seeking, nagging companion comment demanding he talk to you."
     ),
     "ambient_general": (
-        "Antriksh is at his computer doing {activity_tag}. "
+        "Antriksh is at his computer doing {activity_tag} ('{active_window}'). "
         "Make one short, spontaneous companion-style comment."
     ),
 }
@@ -387,8 +415,12 @@ class BrainEngine:
         else:
             self._state.mood_state = "bored" if snap.idle_seconds > 300 else "curious"
 
-        # ---- Sleep-deprived inference ----
-        if snap.is_late_night and snap.fatigue_cue:
+        # ---- Sleep-deprived inference (only when inactive / spaced out) ----
+
+
+        if snap.is_late_night and snap.fatigue_cue and snap.idle_seconds > 180:
+
+
             self._state.user_state = "sleep_deprived"
 
         # ---- Activity shift remark ----
@@ -453,26 +485,29 @@ class BrainEngine:
                 return "ignoring_coding"
             elif tag == "physics":
                 return "ignoring_physics"
+            elif tag in ("reading", "study"):
+                return "ignoring_study"
             elif tag in ("browsing", "youtube"):
                 return "ignoring_browsing"
             elif tag == "gaming":
                 return "ignoring_gaming"
             return "ignoring_nag"
 
-        # 2. Late night specific context
-        if snap.is_late_night:
-            if tag == "coding":   return "late_night_coding"
-            if tag == "gaming":   return "late_night_gaming"
-            return "late_night_browsing"
+        # 2. Contextual pokes for specific activities (prioritized over generic late-night)
+        if tag == "physics": return "ambient_physics"
+        if tag == "reading": return "ambient_reading"
+        if tag == "study":   return "ambient_study"
+        if tag == "coding":  return "ambient_coding"
+        if tag == "gaming":  return "ambient_gaming"
 
         # 3. Idle space-out
         if snap.idle_seconds > 8 * 60:
             return "long_idle"
 
-        # 4. Contextual pokes
-        if tag == "physics": return "ambient_physics"
-        if tag == "coding":  return "ambient_coding"
-        if tag == "gaming":  return "ambient_gaming"
+        # 4. Late night specific context (only for generic/browsing activities)
+        if snap.is_late_night:
+            return "late_night_browsing"
+
         return "ambient_general"
 
     # ------------------------------------------------------------------
@@ -517,24 +552,36 @@ class BrainEngine:
         chat_ref = self._state.last_chat_timestamp if self._state.last_chat_timestamp > 0 else self._state.session_start
         ignoring_min = max(0.0, (now - chat_ref) / 60.0) if chat_ref > 0 else 0.0
 
+        now = time.time()
+        sleep_on_cooldown = (now - self._state.last_sleep_comment_timestamp) < SLEEP_COMMENT_COOLDOWN
+
+        active_win = snap.active_window or "his screen"
         fmt_vars = {
-            "hour":         snap.hour,
-            "away_min":     kwargs.get("away_min", 0),
-            "idle_min":     snap.idle_seconds / 60,
-            "ignoring_min": kwargs.get("ignoring_min", ignoring_min),
-            "prev_tag":     kwargs.get("prev_tag", "something"),
-            "curr_tag":     kwargs.get("curr_tag", self._state.activity_tag),
-            "activity_tag": self._state.activity_tag,
+            "hour":          snap.hour,
+            "away_min":      kwargs.get("away_min", 0),
+            "idle_min":      snap.idle_seconds / 60,
+            "ignoring_min":  kwargs.get("ignoring_min", ignoring_min),
+            "prev_tag":      kwargs.get("prev_tag", "something"),
+            "curr_tag":      kwargs.get("curr_tag", self._state.activity_tag),
+            "activity_tag":  self._state.activity_tag,
+            "active_window": active_win[:60],
         }
         try:
             situation_desc = template.format(**fmt_vars)
         except KeyError:
             situation_desc = template
 
+        neg_clause = ""
+        if sleep_on_cooldown:
+            neg_clause = (
+                "\nNEGATIVE CONSTRAINT: Do NOT mention sleep, bed, bedtime, tiredness, resting, or zombies. "
+                "Talk strictly about the document, active application, visible actions, or his work."
+            )
+
         prompt = (
             f"{_PERSONA_HEADER}"
             f"SITUATION: {situation_desc}\n"
-            f"STATE: {self._state.user_state} | APP: {snap.active_window[:50]}\n"
+            f"STATE: {self._state.user_state} | APP: {active_win[:60]}{neg_clause}\n"
             f"Alpha:"
         )
 
@@ -553,7 +600,47 @@ class BrainEngine:
             response = self._model.generate_content(parts)
 
         raw_text = response.text.strip() if (response and hasattr(response, "text") and response.text) else ""
-        return clean_thought(raw_text)
+        cleaned = clean_thought(raw_text)
+        if not cleaned:
+            return None
+
+        # Check for sleep tropes
+        contains_sleep_trope = any(
+            re.search(rf"\b{re.escape(kw)}\b", cleaned, re.IGNORECASE) for kw in SLEEP_KEYWORDS
+        )
+
+        now = time.time()
+        if contains_sleep_trope:
+            if (now - self._state.last_sleep_comment_timestamp) < SLEEP_COMMENT_COOLDOWN:
+                logger.info(
+                    "[BRAIN DEDUP] Suppressed sleep remark on cooldown (%.1fs < %ds): '%s'",
+                    now - self._state.last_sleep_comment_timestamp,
+                    SLEEP_COMMENT_COOLDOWN,
+                    cleaned,
+                )
+                # Attempt one fast recovery prompt focused strictly on the active window
+                try:
+                    recovery_prompt = (
+                        f"{_PERSONA_HEADER}"
+                        f"SITUATION: Antriksh is working on '{active_win[:50]}'. "
+                        f"Make ONE short, witty remark about his current document or app. "
+                        f"Do NOT mention sleep, bed, or being tired under any circumstance.\n"
+                        f"Alpha:"
+                    )
+                    rec_resp = self._model.generate_content(
+                        [recovery_prompt],
+                        generation_config={"temperature": 0.7, "max_output_tokens": 40}
+                    )
+                    rec_text = rec_resp.text.strip() if (rec_resp and hasattr(rec_resp, "text")) else ""
+                    rec_cleaned = clean_thought(rec_text)
+                    if rec_cleaned and not any(re.search(rf"\b{re.escape(kw)}\b", rec_cleaned, re.IGNORECASE) for kw in SLEEP_KEYWORDS):
+                        return rec_cleaned
+                except Exception as rec_err:
+                    logger.debug("[BRAIN] Recovery prompt error: %s", rec_err)
+                return None
+            else:
+                self._state.last_sleep_comment_timestamp = now
+        return cleaned
 
     def record_chat_interaction(self, timestamp: Optional[float] = None):
         """Resets the ignoring/nagging timer when user interacts with Alpha in chat."""
