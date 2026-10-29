@@ -1,12 +1,64 @@
-(
-echo alpha_env/
-echo venv/
-echo __pycache__/
-echo *.pyc
-echo *.log
-echo .env
-echo *.exe
-echo *.dll
-echo *.bundle
-echo *.unity3d
-) > "%USERPROFILE%\Desktop\AlphaVision-Bridge\.gitignore"
+# Environment & Secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Virtual Environments
+alpha_env/
+env/
+venv/
+.venv/
+ENV/
+Include/
+Lib/
+Scripts/
+share/
+pyvenv.cfg
+
+# Logs
+logs/
+*.log
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Compiled Binaries & Unity Data
+*.dll
+*.exe
+*.so
+*.dylib
+*.unity3d
+*.bundle
+MateEngineX_Data/
+D3D12/
+MonoBleedingEdge/
+
+# Internal State & Runtime Cache
+brain_state.json
+
+# Local Dumps & Temp Analysis Files
+mate_internals*
+mate_real_internals*
+csharp_chat_dump*
+chat_source_code*
+repomix-output*
+dump_internals*
+
+# Local Scratch & Legacy Scripts
+AnimeVision - Copy.py
+AnimeVision_2.py
+AnimeVisionw.py
+project_context.md
+package_info.json
+GEMINI.md
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

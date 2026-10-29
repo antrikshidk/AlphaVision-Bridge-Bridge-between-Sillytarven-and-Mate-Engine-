@@ -1,0 +1,52 @@
+/* MateEngine Bridge Extension Styles */
+
+.mateengine-settings {
+    margin-bottom: 10px;
+}
+
+.mateengine-settings-content {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 0;
+}
+
+.mateengine-settings-content label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mateengine-settings-content .checkbox_label {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+}
+
+.mex-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+    background: var(--SmartThemeBlurTintColor);
+    border-radius: 4px;
+}
+
+.mex-status-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #888;
+}
+
+.mex-status-text {
+    font-size: 0.9em;
+}
+
+#mex_test_connection {
+    margin-top: 5px;
+}
+
+#mex_bridge_url {
+    width: 100%;
+}

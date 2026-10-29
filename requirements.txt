@@ -1,9 +1,20 @@
-(
-echo opencv-python>=4.8.0
-echo Pillow>=10.0.0
-echo mss>=9.0.1
-echo flask>=3.0.0
-echo flask-cors>=4.0.0
-echo requests>=2.31.0
-echo google-generativeai>=0.8.0
-) > "%USERPROFILE%\Desktop\AlphaVision-Bridge\requirements.txt"
+# AlphaVision Awareness Engine & Dual-Channel Bridge Dependencies
+# Core Web Bridge & APIs
+Flask>=2.2.0
+flask-cors>=3.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+
+# Multimodal LLM & Cognitive State
+google-generativeai>=0.8.0
+
+# Computer Vision & Hardware Perception
+opencv-python>=4.6.0
+mediapipe>=0.10.0
+Pillow>=9.0.0
+numpy>=1.22.0
+
+# Desktop OS Telemetry & Screen Capture (Windows DWM Safe)
+pywin32>=306
+mss>=9.0.0
+pyautogui>=0.9.54
