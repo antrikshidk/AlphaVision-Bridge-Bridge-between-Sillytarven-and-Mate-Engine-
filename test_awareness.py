@@ -911,6 +911,51 @@ class TestMediaPipeImportAndInChatSpontaneousPoking(unittest.TestCase):
         self.assertIn('"showBubble":      False', src)
 
 
+
+class TestVisionGatingAndBubbleDismissal(unittest.TestCase):
+    """
+    Tests for Vision Intent Gating (latency optimization: 32s -> 1.5s)
+    and MateEngine desktop speech bubble auto-dismissal.
+    """
+
+    def test_vision_intent_gating_keywords(self):
+        """Conversational messages must NOT request vision; screen/camera questions MUST."""
+        from AnimeVision import is_vision_requested
+
+        # Text-only queries (must NOT trigger heavy multimodal upload)
+        self.assertFalse(is_vision_requested("YO"))
+        self.assertFalse(is_vision_requested("Talk to me!"))
+        self.assertFalse(is_vision_requested("How was your day?"))
+        self.assertFalse(is_vision_requested("hello"))
+
+        # Vision-dependent queries (must trigger multimodal upload)
+        self.assertTrue(is_vision_requested("WHAT IS ON MY SCREEN IN THE TYPE BAR"))
+        self.assertTrue(is_vision_requested("look at me"))
+        self.assertTrue(is_vision_requested("can you see what I'm wearing?"))
+        self.assertTrue(is_vision_requested("check my webcam"))
+        self.assertTrue(is_vision_requested("what tabs do I have open?"))
+
+    def test_bubble_auto_dismissal_scheduling(self):
+        """schedule_bubble_auto_dismiss must create a daemon timer and allow graceful execution."""
+        from AnimeVision import schedule_bubble_auto_dismiss, clear_mateengine_bubble, _dismiss_lock
+        import AnimeVision
+
+        # Calling schedule_bubble_auto_dismiss must establish an active timer
+        schedule_bubble_auto_dismiss(delay_sec=10.0)
+        with AnimeVision._dismiss_lock:
+            self.assertIsNotNone(AnimeVision._dismiss_timer)
+            self.assertTrue(AnimeVision._dismiss_timer.daemon)
+            # Clean up timer so test exits cleanly
+            AnimeVision._dismiss_timer.cancel()
+
+    def test_chat_reply_show_bubble_disabled(self):
+        """AnimeVision chat reply dispatcher must send show_bubble=False by default."""
+        import inspect
+        from AnimeVision import universal_chat_bridge
+        src = inspect.getsource(universal_chat_bridge)
+        self.assertIn('"show_bubble": False', src)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -933,6 +978,7 @@ if __name__ == "__main__":
         TestIgnoringAndNaggingTriggers,
         TestThoughtQueueAndInputRouting,
         TestMediaPipeImportAndInChatSpontaneousPoking,
+        TestVisionGatingAndBubbleDismissal,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

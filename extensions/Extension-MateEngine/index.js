@@ -954,11 +954,11 @@ async function executeInChatInsertion(cleanText, characterName) {
         // 1. Append directly to chat session
         context.chat.push(message);
 
-        // 2. Render in chat DOM
+        // 2. Render in chat DOM with auto-scroll
         if (typeof addOneMessage === 'function') {
-            addOneMessage(message);
+            addOneMessage(message, { scroll: true });
         } else if (typeof context.addOneMessage === 'function') {
-            context.addOneMessage(message);
+            context.addOneMessage(message, { scroll: true });
         }
 
         const messageId = context.chat.length - 1;
@@ -1105,7 +1105,11 @@ async function processPendingChats() {
                 }
 
                 // Send purely clean user message without prepended prompt leak
-                await sendMessageAsUser(rawUserMessage, '');
+                // Explicitly resolve user persona name so user turns never render with character name 'Alpha'
+                const effectiveUserName = (context.name1 && context.name1.toLowerCase() !== (context.name2 || 'Alpha').toLowerCase())
+                    ? context.name1
+                    : 'Antriksh';
+                await sendMessageAsUser(rawUserMessage, '', null, false, effectiveUserName);
 
                 // Ensure UI display DOM strips out any injected prefix before saving to chat history
                 try {
@@ -1193,6 +1197,8 @@ async function processPendingChats() {
                     try {
                         console.log(`${DEBUG_PREFIX} Dispatching response to MateEngine bridge (:8787)...`);
                         await sendChatMessage(aiResponse, context.characterName || 'Alpha');
+                        // Auto-dismiss desktop speech bubble after 4 seconds to prevent piling up
+                        scheduleBubbleDismiss(4);
                     } catch (dispatchErr) {
                         console.warn(`${DEBUG_PREFIX} Bridge dispatch error:`, dispatchErr.message);
                     }

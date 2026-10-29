@@ -1,6 +1,15 @@
 import io
 import os
 import sys
+
+# Ensure script executes in local alpha_env venv if accidentally invoked via global python
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_venv_py = os.path.join(_script_dir, "Scripts", "python.exe")
+if os.path.exists(_venv_py) and os.path.normcase(sys.executable) != os.path.normcase(_venv_py):
+    try:
+        os.execv(_venv_py, [_venv_py] + sys.argv)
+    except Exception:
+        pass
 import re
 import signal
 import logging
@@ -165,6 +174,46 @@ _last_mateengine_sent_time = 0.0
 _mateengine_send_lock = threading.Lock()
 
 
+# Vision Intent Gating: only upload heavy webcam/screen frames if user asks
+VISION_KEYWORDS = (
+    'screen', 'look', 'see', 'webcam', 'camera', 'type bar', 'reading', 'watching',
+    'what is on', "what's on", 'window', 'app', 'tabs', 'wearing', 'shirt',
+    'room', 'desk', 'face', 'expression', 'glance', 'can you see', 'look at'
+)
+
+def is_vision_requested(message: str) -> bool:
+    """Returns True if user explicitly requests visual analysis of camera or screen."""
+    if not message:
+        return False
+    msg_lower = str(message).lower()
+    return any(kw in msg_lower for kw in VISION_KEYWORDS)
+
+
+_dismiss_timer: Optional[threading.Timer] = None
+_dismiss_lock = threading.Lock()
+
+def clear_mateengine_bubble():
+    """Sends an empty payload to :8787/api/chat with showBubble=False to clear speech bubbles."""
+    try:
+        url = f"http://127.0.0.1:{MATEENGINE_PORT}/api/chat"
+        requests.post(url, json={"text": "", "characterName": "Alpha", "showBubble": False}, timeout=1.0)
+    except Exception:
+        pass
+
+def schedule_bubble_auto_dismiss(delay_sec: float = 4.5):
+    """Schedules an auto-dismissal of any active speech bubble in MateEngine after delay_sec."""
+    global _dismiss_timer
+    with _dismiss_lock:
+        if _dismiss_timer is not None:
+            try:
+                _dismiss_timer.cancel()
+            except Exception:
+                pass
+        _dismiss_timer = threading.Timer(delay_sec, clear_mateengine_bubble)
+        _dismiss_timer.daemon = True
+        _dismiss_timer.start()
+
+
 def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=False, force=False):
     """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication and BMP glyph sanitization."""
     global _last_mateengine_sent_text, _last_mateengine_sent_time
@@ -196,6 +245,8 @@ def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lips
     }
     try:
         requests.post(url, json=payload, timeout=1.5)
+        if show_bubble:
+            schedule_bubble_auto_dismiss(4.5)
     except Exception as e:
         app_logger.debug(f"[SYNC WARN] Could not push to MateEngine ({MATEENGINE_PORT}): {e}")
 
@@ -250,7 +301,7 @@ def live_sensor_and_cache_worker():
                                     "character_name": "Alpha",
                                     "emotion": "joy",
                                     "trigger_lipsync": True,
-                                    "show_bubble": True
+                                    "show_bubble": False
                                 },
                                 daemon=True
                             ).start()
@@ -269,17 +320,17 @@ def live_sensor_and_cache_worker():
 
                     if cam_frame is not None:
                         try:
-                            cam_small = cv2.resize(cam_frame, (480, 360))
-                            ret, buf = cv2.imencode('.jpg', cam_small, [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+                            cam_small = cv2.resize(cam_frame, (384, 288))
+                            ret, buf = cv2.imencode('.jpg', cam_small, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
                             if ret:
                                 blobs.append({"mime_type": "image/jpeg", "data": buf.tobytes()})
                         except Exception as cam_err:
                             app_logger.debug(f"[CACHE CAM ERR] {cam_err}")
 
-                    # 2. Desktop screen snapshot
+                    # 2. Desktop screen snapshot (downscaled to 512x288 quality 50 for minimal upload latency)
                     try:
-                        screen_small = cv2.resize(screen_bgr, (640, 360))
-                        ret2, buf2 = cv2.imencode('.jpg', screen_small, [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+                        screen_small = cv2.resize(screen_bgr, (512, 288))
+                        ret2, buf2 = cv2.imencode('.jpg', screen_small, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
                         if ret2:
                             blobs.append({"mime_type": "image/jpeg", "data": buf2.tobytes()})
                     except Exception as scr_err:
@@ -581,7 +632,9 @@ def universal_chat_bridge(path=""):
             f"Alpha (reply directly to Antriksh's message '{user_msg}'):"
         )
 
-        visuals = get_cached_visuals()
+        # Vision Gating: Only attach heavy multi-modal visual frames if user explicitly requested vision
+        needs_vision = is_vision_requested(user_msg)
+        visuals = get_cached_visuals() if needs_vision else []
         gemini_payload = visuals + [user_content_str] if visuals else [user_content_str]
 
         answer = None
@@ -589,7 +642,7 @@ def universal_chat_bridge(path=""):
             chat_model = genai.GenerativeModel(
                 MODEL_NAME,
                 system_instruction=system_instruction_str,
-                generation_config={"temperature": 0.7, "max_output_tokens": 90}
+                generation_config={"temperature": 0.7, "max_output_tokens": 60}
             )
             response = chat_model.generate_content(gemini_payload)
             if response and hasattr(response, "text") and response.text:
@@ -638,10 +691,12 @@ def universal_chat_bridge(path=""):
                     "character_name": "Alpha",
                     "emotion": "joy",
                     "trigger_lipsync": True,
-                    "show_bubble": True
+                    "show_bubble": False
                 },
                 daemon=True
             ).start()
+            # Auto-dismiss any lingering user bubble on MateEngine desktop
+            schedule_bubble_auto_dismiss(delay_sec=5.0)
 
         if not is_streaming:
             return jsonify({
