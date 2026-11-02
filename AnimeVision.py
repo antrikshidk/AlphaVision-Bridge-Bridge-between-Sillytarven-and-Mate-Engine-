@@ -485,6 +485,8 @@ def proactive_observer_loop():
         sleep_duration = random.randint(RANDOM_MSG_MIN_INTERVAL, RANDOM_MSG_MAX_INTERVAL)
         time.sleep(sleep_duration)
 
+        if not _spontaneous_pokes_enabled:
+            continue
         if time.time() - last_interaction_time < RANDOM_MSG_MIN_INTERVAL:
             continue
 
@@ -514,6 +516,70 @@ def proactive_observer_loop():
 _last_popped_pop: Optional[tuple[str, float]] = None
 _pop_lock = threading.Lock()
 
+# Spontaneous pokes runtime config (synced from SillyTavern UI :5001)
+_spontaneous_pokes_enabled: bool = True
+_in_chat_poke_enabled: bool = False
+_desktop_bubbles_enabled: bool = False
+_config_lock = threading.Lock()
+
+
+@app.route('/api/config', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/config', methods=['GET', 'POST', 'OPTIONS'])
+def runtime_config_endpoint():
+    """
+    Receives and synchronizes runtime config from SillyTavern's Extension-MateEngine drawer.
+    Controls spontaneous pokes, desktop speech bubbles, and in-chat delivery.
+    """
+    global _spontaneous_pokes_enabled, _in_chat_poke_enabled, _desktop_bubbles_enabled
+
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+
+    if request.method == 'GET':
+        with _config_lock:
+            return jsonify({
+                "spontaneous_pokes_enabled": _spontaneous_pokes_enabled,
+                "in_chat_poke_enabled": _in_chat_poke_enabled,
+                "desktop_bubbles_enabled": _desktop_bubbles_enabled,
+            }), 200
+
+    data = request.get_json(force=True, silent=True) or {}
+    with _config_lock:
+        if "spontaneous_pokes_enabled" in data:
+            _spontaneous_pokes_enabled = bool(data["spontaneous_pokes_enabled"])
+        elif "spontaneousPokesEnabled" in data:
+            _spontaneous_pokes_enabled = bool(data["spontaneousPokesEnabled"])
+
+        if "in_chat_poke_enabled" in data:
+            _in_chat_poke_enabled = bool(data["in_chat_poke_enabled"])
+        elif "inChatPokeEnabled" in data:
+            _in_chat_poke_enabled = bool(data["inChatPokeEnabled"])
+
+        if "desktop_bubbles_enabled" in data:
+            _desktop_bubbles_enabled = bool(data["desktop_bubbles_enabled"])
+        elif "desktopBubblesEnabled" in data:
+            _desktop_bubbles_enabled = bool(data["desktopBubblesEnabled"])
+
+    if _awareness_brain is not None and hasattr(_awareness_brain, "set_spontaneous_enabled"):
+        _awareness_brain.set_spontaneous_enabled(_spontaneous_pokes_enabled)
+    if _awareness_dispatcher is not None and hasattr(_awareness_dispatcher, "set_spontaneous_enabled"):
+        _awareness_dispatcher.set_spontaneous_enabled(_spontaneous_pokes_enabled)
+
+    app_logger.info(
+        f"[CONFIG SYNC] Runtime config updated: spontaneous_pokes_enabled={_spontaneous_pokes_enabled}, "
+        f"in_chat={_in_chat_poke_enabled}, desktop_bubbles={_desktop_bubbles_enabled}"
+    )
+
+    return jsonify({
+        "success": True,
+        "config": {
+            "spontaneous_pokes_enabled": _spontaneous_pokes_enabled,
+            "in_chat_poke_enabled": _in_chat_poke_enabled,
+            "desktop_bubbles_enabled": _desktop_bubbles_enabled,
+        }
+    }), 200
+
+
 @app.route('/spontaneous_pop', methods=['GET'])
 def pop_spontaneous_thought():
     """
@@ -523,6 +589,8 @@ def pop_spontaneous_thought():
     Rejects candidate thoughts matching last popped thought within a 120s sliding window.
     """
     global _last_popped_pop
+    if not _spontaneous_pokes_enabled:
+        return jsonify({"thought": None, "chat_box_open": chat_box_is_open})
     raw_thought = None
     if spontaneous_thought_queue is not None:
         try:
@@ -852,6 +920,8 @@ def _launch_subconscious_engine():
         snapshot_queue=perc_q,
     )
 
+    _awareness_brain.set_spontaneous_enabled(_spontaneous_pokes_enabled)
+    _awareness_dispatcher.set_spontaneous_enabled(_spontaneous_pokes_enabled)
     _awareness_brain.start()
     _awareness_perception.start()
     print("[SUBCONSCIOUS] AlphaVision Perception + Brain + Dispatcher online.")

@@ -123,6 +123,7 @@ class Dispatcher:
         self._last_push: float  = 0.0
         self._last_dispatched_thought: Optional[tuple[str, float]] = None
         self._recent_dispatches: list[tuple[str, float]] = []
+        self._spontaneous_enabled: bool = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -143,6 +144,10 @@ class Dispatcher:
             return False
 
         from engine.brain import clean_thought, set_last_ambient_poke
+        if not force and not getattr(self, "_spontaneous_enabled", True):
+            logger.debug("[DISPATCHER] Spontaneous remarks suppressed by configuration.")
+            return False
+
         clean_remark = clean_thought(str(remark))
         if not clean_remark:
             return False
@@ -268,6 +273,15 @@ class Dispatcher:
         except Exception as exc:
             logger.warning("[DISPATCHER] HTTP error on %s: %s", url, exc)
             return False
+
+    def set_spontaneous_enabled(self, enabled: bool):
+        with self._lock:
+            self._spontaneous_enabled = bool(enabled)
+
+    @property
+    def spontaneous_enabled(self) -> bool:
+        with self._lock:
+            return getattr(self, "_spontaneous_enabled", True)
 
     # ------------------------------------------------------------------
     # Status

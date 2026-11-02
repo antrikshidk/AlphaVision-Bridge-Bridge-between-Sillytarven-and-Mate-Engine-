@@ -460,8 +460,13 @@ class BrainEngine:
             key = self._select_ambient_key(snap)
             self._fire_remark(key, snap)
 
+    def set_spontaneous_enabled(self, enabled: bool):
+        self._spontaneous_enabled = bool(enabled)
+
     def _should_speak(self, now: float) -> bool:
         """Rate-limit gate."""
+        if not getattr(self, "_spontaneous_enabled", True):
+            return False
         elapsed = now - self._state.last_speech_timestamp
         min_gap = MIN_SPONTANEOUS_INTERVAL
         # After a dramatic event allow slightly shorter gap

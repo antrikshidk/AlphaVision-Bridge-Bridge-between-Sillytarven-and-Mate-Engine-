@@ -55,9 +55,11 @@ let lastKnownChatBoxOpen = true;
 const defaultSettings = {
     enabled: true,
     bridgeUrl: 'http://127.0.0.1:8787',
+    visionUrl: 'http://127.0.0.1:5001',
     autoSendExpressions: true,
     autoLipSync: true,
     debugLogging: false,
+    spontaneousPokesEnabled: true,  // Autonomous spontaneous pokes (:5001)
     inChatPokeEnabled: false,       // Default false: ambient pokes remain transient in desktop bubble & MateEngine
     desktopBubblesEnabled: false,   // Disabled by default so speech bubbles don't stack on desktop
     autoDismissBubbles: true,       // Auto-dismiss desktop speech bubbles if enabled
@@ -666,6 +668,11 @@ function createSettingsUI() {
                         Bridge URL:
                         <input type="text" id="mex_bridge_url" class="text_pole" placeholder="http://localhost:8787" />
                     </label>
+
+                    <label>
+                        Vision Server (:5001):
+                        <input type="text" id="mex_vision_url" class="text_pole" placeholder="http://127.0.0.1:5001" />
+                    </label>
                     
                     <label class="checkbox_label">
                         <input type="checkbox" id="mex_auto_expressions" />
@@ -682,6 +689,11 @@ function createSettingsUI() {
                         <span>Debug logging</span>
                     </label>
                     
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="mex_spontaneous_pokes" />
+                        <span>Enable spontaneous pokes (:5001)</span>
+                    </label>
+
                     <label class="checkbox_label">
                         <input type="checkbox" id="mex_in_chat_poke" />
                         <span>Pipe spontaneous thoughts into active chat</span>
@@ -731,6 +743,12 @@ function bindSettingsUI() {
         saveSettingsDebounced();
     });
 
+    $('#mex_vision_url').val(settings.visionUrl || 'http://127.0.0.1:5001').on('change', function () {
+        settings.visionUrl = $(this).val();
+        saveSettingsDebounced();
+        syncConfigToVisionServer(settings);
+    });
+
     $('#mex_auto_expressions').prop('checked', settings.autoSendExpressions).on('change', function () {
         settings.autoSendExpressions = $(this).prop('checked');
         saveSettingsDebounced();
@@ -746,9 +764,16 @@ function bindSettingsUI() {
         saveSettingsDebounced();
     });
 
+    $('#mex_spontaneous_pokes').prop('checked', settings.spontaneousPokesEnabled !== false).on('change', function () {
+        settings.spontaneousPokesEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+        syncConfigToVisionServer(settings);
+    });
+
     $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled === true).on('change', function () {
         settings.inChatPokeEnabled = $(this).prop('checked');
         saveSettingsDebounced();
+        syncConfigToVisionServer(settings);
     });
 
     $('#mex_desktop_bubbles').prop('checked', settings.desktopBubblesEnabled === true).on('change', function () {
@@ -781,6 +806,38 @@ function bindSettingsUI() {
     });
 }
 
+/**
+ * Syncs spontaneous poke and bubble configuration payload to AlphaVision server (:5001)
+ */
+async function syncConfigToVisionServer(customSettings = null) {
+    const settings = customSettings || extension_settings[MODULE_NAME] || {};
+    const visionUrl = (settings.visionUrl || 'http://127.0.0.1:5001').replace(/\/+$/, '');
+    const payload = {
+        spontaneous_pokes_enabled: settings.spontaneousPokesEnabled !== false,
+        in_chat_poke_enabled: settings.inChatPokeEnabled === true,
+        desktop_bubbles_enabled: settings.desktopBubblesEnabled === true,
+        auto_dismiss_bubbles: settings.autoDismissBubbles !== false,
+        dismiss_timeout: settings.bubbleDismissTimeoutSec || 5,
+    };
+
+    try {
+        const response = await fetch(`${visionUrl}/api/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (response.ok) {
+            console.log(`${DEBUG_PREFIX} Synced config to vision server (:5001):`, payload);
+        } else {
+            console.warn(`${DEBUG_PREFIX} Vision server returned HTTP ${response.status} on config sync`);
+        }
+    } catch (e) {
+        if (settings.debugLogging) {
+            console.debug(`${DEBUG_PREFIX} Vision server (:5001) offline or unreachable during config sync:`, e);
+        }
+    }
+}
+
 // ==================== INITIALIZATION ====================
 
 jQuery(async () => {
@@ -790,6 +847,9 @@ jQuery(async () => {
     const settingsHtml = createSettingsUI();
     $('#extensions_settings2').append(settingsHtml);
     bindSettingsUI();
+
+    // Sync initial runtime configuration to AlphaVision server (:5001)
+    syncConfigToVisionServer(extension_settings[MODULE_NAME]);
 
     // Register slash commands (if available)
     if (registerSlashCommand) {
@@ -998,12 +1058,18 @@ async function executeInChatInsertion(cleanText, characterName) {
  */
 async function processSpontaneousThoughts() {
     try {
+        const settings = extension_settings[MODULE_NAME] || {};
+        if (settings.spontaneousPokesEnabled === false) {
+            return;
+        }
+
         // Check and flush any queued pokes once LLM generation has finished
         if (!isCurrentlyGenerating() && pendingInChatPokes.length > 0) {
             await flushPendingPokes();
         }
 
-        const res = await fetch('http://127.0.0.1:5001/spontaneous_pop');
+        const visionUrl = (settings.visionUrl || 'http://127.0.0.1:5001').replace(/\/+$/, '');
+        const res = await fetch(`${visionUrl}/spontaneous_pop`);
         if (!res.ok) return;
         const data = await res.json();
         if (!data) return;

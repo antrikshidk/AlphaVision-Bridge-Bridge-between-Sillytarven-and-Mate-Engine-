@@ -1073,6 +1073,67 @@ class TestAntiSleepNagAndPrecedence(unittest.TestCase):
         self.assertEqual(key, "ambient_reading")
 
 
+
+# ---------------------------------------------------------------------------
+# 19. Spontaneous Pokes UI Toggle & Config Sync Tests
+# ---------------------------------------------------------------------------
+class TestConfigSyncAndSpontaneousToggle(unittest.TestCase):
+
+    def test_dispatcher_respects_spontaneous_toggle(self):
+        """Dispatcher must suppress spontaneous remarks when disabled via config."""
+        from engine.dispatcher import Dispatcher, ThoughtQueue
+        q = ThoughtQueue()
+        d = Dispatcher(mateengine_port=8787, shared_thought_queue=q)
+        d.set_spontaneous_enabled(False)
+        self.assertFalse(d.spontaneous_enabled)
+
+        # Spontaneous push should be rejected
+        res = d.push("Spontaneous remark while disabled")
+        self.assertFalse(res)
+        self.assertTrue(q.empty())
+
+        # Forced push should still succeed
+        res_forced = d.push("Direct chat remark", force=True)
+        self.assertTrue(res_forced)
+
+    def test_brain_respects_spontaneous_toggle(self):
+        """BrainEngine must not speak when spontaneous remarks are disabled."""
+        from engine.brain import BrainEngine
+        brain = BrainEngine(queue.Queue(), MagicMock(), MagicMock())
+        brain.set_spontaneous_enabled(False)
+        self.assertFalse(brain._should_speak(time.time() + 9999))
+
+        brain.set_spontaneous_enabled(True)
+        # Should be eligible to speak once time since last speech > min interval
+        brain._state.last_speech_timestamp = 0.0
+        brain._state.user_state = "focused"
+        self.assertTrue(brain._should_speak(time.time() + 9999))
+
+    def test_animevision_config_endpoint_sync(self):
+        """AnimeVision /api/config must synchronize spontaneous_pokes_enabled payload."""
+        import AnimeVision
+        client = AnimeVision.app.test_client()
+
+        # Test POST sync to disable
+        resp = client.post("/api/config", json={"spontaneous_pokes_enabled": False})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data.get("success"))
+        self.assertFalse(data["config"]["spontaneous_pokes_enabled"])
+        self.assertFalse(AnimeVision._spontaneous_pokes_enabled)
+
+        # Verify /spontaneous_pop returns None when disabled
+        pop_resp = client.get("/spontaneous_pop")
+        self.assertEqual(pop_resp.status_code, 200)
+        pop_data = pop_resp.get_json()
+        self.assertIsNone(pop_data.get("thought"))
+
+        # Test POST sync to re-enable
+        resp2 = client.post("/api/config", json={"spontaneous_pokes_enabled": True})
+        self.assertEqual(resp2.status_code, 200)
+        self.assertTrue(AnimeVision._spontaneous_pokes_enabled)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -1098,6 +1159,7 @@ if __name__ == "__main__":
         TestVisionGatingAndBubbleDismissal,
         TestLowLightAndHighResVision,
         TestAntiSleepNagAndPrecedence,
+        TestConfigSyncAndSpontaneousToggle,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
