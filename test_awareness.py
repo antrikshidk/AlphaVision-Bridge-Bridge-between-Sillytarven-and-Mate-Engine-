@@ -958,6 +958,26 @@ class TestVisionGatingAndBubbleDismissal(unittest.TestCase):
         from AnimeVision import universal_chat_bridge
         src = inspect.getsource(universal_chat_bridge)
         self.assertIn('"show_bubble": True', src)
+        self.assertIn('"spontaneous": False', src)
+        self.assertIn('"force": True', src)
+
+    def test_spontaneous_thought_queue_preserved_during_chat(self):
+        """Spontaneous thought queue must retain entries and not be purged during chat input."""
+        import inspect
+        from AnimeVision import universal_chat_bridge
+        src = inspect.getsource(universal_chat_bridge)
+        self.assertNotIn('spontaneous_thought_queue.popleft()', src)
+
+    def test_extension_index_js_show_bubble_and_spontaneous_routing(self):
+        """Extension index.js must enforce showBubble=true and spontaneous=false on direct chat responses."""
+        import os
+        ext_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extensions", "Extension-MateEngine", "index.js")
+        with open(ext_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+        self.assertIn("inChatPokeEnabled: true", js_content)
+        self.assertIn("desktopBubblesEnabled: true", js_content)
+        self.assertIn("sendChatMessage(aiResponse, context.characterName || 'Alpha', 'joy', true)", js_content)
+        self.assertIn("isSpontaneous = (showBubble === true) ? false", js_content)
 
 
 

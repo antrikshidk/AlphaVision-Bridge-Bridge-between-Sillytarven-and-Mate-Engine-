@@ -60,8 +60,8 @@ const defaultSettings = {
     autoLipSync: true,
     debugLogging: false,
     spontaneousPokesEnabled: true,  // Autonomous spontaneous pokes (:5001)
-    inChatPokeEnabled: false,       // Default false: ambient pokes remain transient in desktop bubble & MateEngine
-    desktopBubblesEnabled: false,   // Disabled by default so speech bubbles don't stack on desktop
+    inChatPokeEnabled: true,        // Default true: pipe spontaneous remarks into active SillyTavern chat
+    desktopBubblesEnabled: true,    // Enabled so chat responses and speech bubbles display in MateEngine
     autoDismissBubbles: true,       // Auto-dismiss desktop speech bubbles if enabled
     bubbleDismissTimeoutSec: 5,     // 5 seconds auto-dismissal
 };
@@ -300,10 +300,13 @@ function scheduleBubbleDismiss(delaySeconds = 5) {
  */
 async function sendChatMessage(text, characterName = null, emotion = null, showBubble = null) {
     const settings = extension_settings[MODULE_NAME] || {};
-    // Determine whether to show bubble: default false for spontaneous, respect setting otherwise
+    // Determine whether to show bubble: explicit parameter takes priority, otherwise check desktopBubblesEnabled setting (default true)
     const shouldShowBubble = (showBubble !== null)
         ? Boolean(showBubble)
-        : (settings.desktopBubblesEnabled === true);
+        : (settings.desktopBubblesEnabled !== false);
+
+    // Direct conversational replies (when showBubble is explicitly true) are not spontaneous pokes
+    const isSpontaneous = (showBubble === true) ? false : (showBubble === false ? true : (settings.desktopBubblesEnabled === false));
 
     const data = {
         text: text,
@@ -315,7 +318,7 @@ async function sendChatMessage(text, characterName = null, emotion = null, showB
         showBubble: shouldShowBubble,
         is_bubble: shouldShowBubble,
         add_to_chat: true,
-        spontaneous: true
+        spontaneous: isSpontaneous
     };
     const result = await sendToBridge('chat', data);
 
@@ -770,13 +773,13 @@ function bindSettingsUI() {
         syncConfigToVisionServer(settings);
     });
 
-    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled === true).on('change', function () {
+    $('#mex_in_chat_poke').prop('checked', settings.inChatPokeEnabled !== false).on('change', function () {
         settings.inChatPokeEnabled = $(this).prop('checked');
         saveSettingsDebounced();
         syncConfigToVisionServer(settings);
     });
 
-    $('#mex_desktop_bubbles').prop('checked', settings.desktopBubblesEnabled === true).on('change', function () {
+    $('#mex_desktop_bubbles').prop('checked', settings.desktopBubblesEnabled !== false).on('change', function () {
         settings.desktopBubblesEnabled = $(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -1106,7 +1109,7 @@ async function processSpontaneousThoughts() {
 
         // 2. Channel B: Pipe ALL spontaneous thoughts directly into SillyTavern active chat
         const settings = extension_settings[MODULE_NAME] || {};
-        if (settings.inChatPokeEnabled === true) {
+        if (settings.inChatPokeEnabled !== false) {
             await deliverInChatPoke(cleanText, characterName);
         }
     } catch (e) {
@@ -1267,9 +1270,10 @@ async function processPendingChats() {
 
                     try {
                         console.log(`${DEBUG_PREFIX} Dispatching response to MateEngine bridge (:8787)...`);
-                        await sendChatMessage(aiResponse, context.characterName || 'Alpha');
-                        // Auto-dismiss desktop speech bubble after 4 seconds to prevent piling up
-                        scheduleBubbleDismiss(4);
+                        // Explicitly force showBubble=true to clear the "..." bubble in MateEngine
+                        await sendChatMessage(aiResponse, context.characterName || 'Alpha', 'joy', true);
+                        // Auto-dismiss desktop speech bubble after 5 seconds to prevent piling up
+                        scheduleBubbleDismiss(5);
                     } catch (dispatchErr) {
                         console.warn(`${DEBUG_PREFIX} Bridge dispatch error:`, dispatchErr.message);
                     }

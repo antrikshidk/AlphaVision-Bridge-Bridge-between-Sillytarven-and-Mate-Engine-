@@ -263,7 +263,10 @@ class Dispatcher:
     def _http_post(url: str, payload: dict) -> bool:
         try:
             r = requests.post(url, json=payload, timeout=_MATEENGINE_TIMEOUT)
-            return r.status_code < 400
+            if r.status_code >= 400:
+                logger.warning("[DISPATCHER] HTTP error %d from %s: %s", r.status_code, url, r.text[:200])
+                return False
+            return True
         except requests.exceptions.ConnectionError:
             logger.warning("[DISPATCHER] Connection refused on %s (MateEngine not running or port closed)", url)
             return False

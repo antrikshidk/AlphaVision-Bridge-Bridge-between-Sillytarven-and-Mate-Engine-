@@ -222,7 +222,7 @@ def schedule_bubble_auto_dismiss(delay_sec: float = 4.5):
         _dismiss_timer.start()
 
 
-def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=True, force=False):
+def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lipsync=True, show_bubble=True, force=False, spontaneous=False):
     """Direct speech / animation hook to MateEngine runtime on :8787/api/chat with deduplication and BMP glyph sanitization."""
     global _last_mateengine_sent_text, _last_mateengine_sent_time
     if not text or not str(text).strip():
@@ -254,14 +254,14 @@ def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lips
         "showBubble": show_bubble,
         "is_bubble": show_bubble,
         "add_to_chat": True,
-        "spontaneous": True
+        "spontaneous": spontaneous
     }
     try:
-        requests.post(url, json=payload, timeout=1.5)
+        requests.post(url, json=payload, timeout=2.5)
         if show_bubble:
-            schedule_bubble_auto_dismiss(4.5)
+            schedule_bubble_auto_dismiss(5.0)
     except Exception as e:
-        app_logger.debug(f"[SYNC WARN] Could not push to MateEngine ({MATEENGINE_PORT}): {e}")
+        app_logger.warning(f"[SYNC WARN] Could not push to MateEngine ({MATEENGINE_PORT}): {e}")
 
 
 # =========================================================
@@ -720,13 +720,6 @@ def universal_chat_bridge(path=""):
                 ambient_context = f'You recently remarked to Antriksh: "{poke_text}". He just opened the chat to respond.'
             clear_last_ambient_poke()
 
-        # Clear any stale spontaneous thoughts so conversational dialogue remains clean and ambient thoughts never hijack chat
-        while not spontaneous_thought_queue.empty():
-            try:
-                spontaneous_thought_queue.popleft()
-            except Exception:
-                break
-
         with memory_lock:
             recent_transcript = "\n".join(
                 f"{'Antriksh' if m['role'] == 'user' else 'Alpha'}: {m['content']}"
@@ -799,15 +792,11 @@ def universal_chat_bridge(path=""):
 
         app_logger.info(f"[REPLY GENERATED in {time.time() - t_start:.2f}s] {final_delivery}")
 
-        # Track latest generated reply
-        to_dispatch_now = None
+        # Track latest generated reply and dispatch directly to MateEngine
+        to_dispatch_now = final_delivery
         with reply_lock:
             last_generated_reply = final_delivery
-            if chat_box_is_open:
-                reply_pushed_to_engine = True
-                to_dispatch_now = final_delivery
-            else:
-                reply_pushed_to_engine = False
+            reply_pushed_to_engine = True
 
         if to_dispatch_now:
             threading.Thread(
@@ -817,7 +806,9 @@ def universal_chat_bridge(path=""):
                     "character_name": "Alpha",
                     "emotion": "joy",
                     "trigger_lipsync": True,
-                    "show_bubble": True
+                    "show_bubble": True,
+                    "force": True,
+                    "spontaneous": False
                 },
                 daemon=True
             ).start()
