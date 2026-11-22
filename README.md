@@ -3,7 +3,7 @@
 > **A multimodal, dual-channel cognitive bridge connecting SillyTavern + MateEngine powered by Google Gemini**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-78%20Passing-brightgreen?logo=pytest)](test_awareness.py)
+[![Tests](https://img.shields.io/badge/Tests-81%20Passing-brightgreen?logo=pytest)](test_awareness.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Gemini](https://img.shields.io/badge/Powered%20by-Gemini%20Flash-orange?logo=google)](https://ai.google.dev/)
 [![SillyTavern](https://img.shields.io/badge/SillyTavern-Extension-purple)](extensions/Extension-MateEngine/)
@@ -259,7 +259,7 @@ call alpha_env\Scripts\activate
 python test_awareness.py
 ```
 
-**78 tests across 18 test classes:**
+**81 tests across 18 test classes:**
 
 | Test Class | What It Covers |
 |------------|---------------|
@@ -279,13 +279,13 @@ python test_awareness.py
 | `TestThoughtQueueAndInputRouting` | Duplicate rejection, context-leak stripping |
 | `TestMediaPipeImportAndInChatSpontaneousPoking` | MediaPipe availability, in-chat poke formatting |
 | `TestVisionGatingAndBubbleDismissal` | Vision intent gating, bubble scheduling, JS routing checks |
-| `TestLowLightAndHighResVision` | CLAHE + gamma boost, 512px capture, study window tagging |
+| `TestLowLightAndHighResVision` | 1024px composite screen + PiP webcam, CLAHE boost, degradation fallbacks |
 | `TestAntiSleepNagAndPrecedence` | Sleep-nag cooldown (35min), study tag priority over `late_night` |
 | `TestConfigSyncAndSpontaneousToggle` | Live config endpoint, brain/dispatcher enable/disable |
 
 ```
 ----------------------------------------------------------------------
-Ran 78 tests in 10.2s
+Ran 81 tests in 10.3s
 
 OK
 ```
@@ -330,7 +330,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup guide.
 Quick summary:
 1. Fork & clone the repo
 2. Create a venv with `requirements.txt`
-3. Run `python test_awareness.py` — all 78 tests must pass before you open a PR
+3. Run `python test_awareness.py` — all 81 tests must pass before you open a PR
 4. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages
 
 ---

@@ -51,6 +51,7 @@ from engine.perception import (
     SafeScreenGrabber,
     capture_screen_gdi,
     enhance_low_light,
+    compose_screen_and_camera,
 )
 from engine.brain import (
     BrainEngine,
@@ -181,7 +182,8 @@ VISION_KEYWORDS = (
     'what is on', "what's on", 'window', 'app', 'tabs', 'wearing', 'shirt',
     'room', 'desk', 'face', 'expression', 'glance', 'can you see', 'look at',
     'holding', 'hold up', 'show', 'showing', 'book', 'notes', 'read this',
-    'check this', 'what is this', 'solve this', 'paper', 'solve', 'formula'
+    'check this', 'what is this', 'solve this', 'paper', 'solve', 'formula',
+    'desktop', 'monitor', 'display', 'problem', 'equation', 'diagram', 'pdf'
 )
 
 def is_vision_requested(message: str) -> bool:
@@ -290,6 +292,10 @@ def live_sensor_and_cache_worker():
         try:
             screen_bgr = grabber.grab_bgr()
             if screen_bgr is not None:
+                # Keep PerceptionEngine synced with latest screen frame
+                if _awareness_perception is not None:
+                    _awareness_perception.update_screen_frame(screen_bgr)
+
                 is_raw_open = detect_opaque_input_box(screen_bgr)
                 is_debounced_open, state_changed = debouncer.update(is_raw_open)
 
@@ -322,47 +328,22 @@ def live_sensor_and_cache_worker():
                         print("\n[SENSOR] >>> Chat Box CLOSED on screen! <<<")
                         chat_open_event.clear()
 
-                # Update raw JPEG cache every 1.0s (screen + safe hardware camera snapshot)
+                # Update raw visual cache every 1.0s (unified 1024px composite screen + live webcam PiP)
                 now = time.time()
                 if now - last_cache_time >= 1.0:
-                    blobs = []
-                    # 1. Non-blocking camera frame query from PerceptionEngine's CameraWorker
                     cam_frame = None
                     if _awareness_perception is not None:
                         cam_frame = _awareness_perception.get_latest_frame()
 
-                    if cam_frame is not None:
-                        try:
-                            # Apply low-light enhancement (CLAHE + gamma boost)
-                            cam_enh = enhance_low_light(cam_frame)
-                            ch, cw = cam_enh.shape[:2]
-                            c_max = 512
-                            if max(ch, cw) > c_max:
-                                c_scale = c_max / float(max(ch, cw))
-                                cam_small = cv2.resize(cam_enh, (int(cw * c_scale), int(ch * c_scale)), interpolation=cv2.INTER_AREA)
-                            else:
-                                cam_small = cam_enh
-                            ret, buf = cv2.imencode('.jpg', cam_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-                            if ret:
-                                blobs.append({"mime_type": "image/jpeg", "data": buf.tobytes()})
-                        except Exception as cam_err:
-                            app_logger.debug(f"[CACHE CAM ERR] {cam_err}")
-
-                    # 2. Desktop screen snapshot (downscaled to max 512px quality 75 for sharp clarity)
-                    try:
-                        sh, sw = screen_bgr.shape[:2]
-                        s_max = 512
-                        if max(sh, sw) > s_max:
-                            s_scale = s_max / float(max(sh, sw))
-                            screen_small = cv2.resize(screen_bgr, (int(sw * s_scale), int(sh * s_scale)), interpolation=cv2.INTER_AREA)
-                        else:
-                            screen_small = screen_bgr
-                        ret2, buf2 = cv2.imencode('.jpg', screen_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-                        if ret2:
-                            blobs.append({"mime_type": "image/jpeg", "data": buf2.tobytes()})
-                    except Exception as scr_err:
-                        app_logger.debug(f"[CACHE SCREEN ERR] {scr_err}")
-
+                    composite_jpeg = compose_screen_and_camera(
+                        screen_bgr=screen_bgr,
+                        cam_bgr=cam_frame,
+                        target_screen_width=1024,
+                        pip_width=280,
+                        quality=75,
+                        enhance_lighting=True,
+                    )
+                    blobs = [{"mime_type": "image/jpeg", "data": composite_jpeg}] if composite_jpeg else []
                     with visual_cache_lock:
                         cached_visual_blobs = blobs
                     last_cache_time = now
@@ -375,33 +356,29 @@ def live_sensor_and_cache_worker():
 
 def get_cached_visuals(force_fresh: bool = False):
     """
-    Returns cached JPEG frame blobs (webcam + screen).
+    Returns cached JPEG frame blobs (unified composite screen + webcam).
     If force_fresh=True, immediately queries the latest hardware camera frame
     and desktop screen snapshot with low-light enhancement (CLAHE + gamma boost)
-    at quality=75, guaranteeing crisp legibility when user asks vision questions.
+    and renders a fresh 1024px composite frame with PiP webcam, guaranteeing
+    crisp legibility of text, formulas, and code.
     """
     if force_fresh:
         try:
-            fresh_blobs = []
+            cam_frame = None
             if _awareness_perception is not None:
-                blob = _awareness_perception.capture_frame_blob(max_dimension=512, quality=75, enhance_lighting=True)
-                if blob:
-                    fresh_blobs.append(blob)
+                cam_frame = _awareness_perception.get_latest_frame()
 
             scr_bgr = capture_screen_gdi()
-            if scr_bgr is not None:
-                sh, sw = scr_bgr.shape[:2]
-                s_max = 512
-                if max(sh, sw) > s_max:
-                    s_scale = s_max / float(max(sh, sw))
-                    scr_small = cv2.resize(scr_bgr, (int(sw * s_scale), int(sh * s_scale)), interpolation=cv2.INTER_AREA)
-                else:
-                    scr_small = scr_bgr
-                ret_s, buf_s = cv2.imencode('.jpg', scr_small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-                if ret_s:
-                    fresh_blobs.append({"mime_type": "image/jpeg", "data": buf_s.tobytes()})
-            if fresh_blobs:
-                return fresh_blobs
+            composite_jpeg = compose_screen_and_camera(
+                screen_bgr=scr_bgr,
+                cam_bgr=cam_frame,
+                target_screen_width=1024,
+                pip_width=280,
+                quality=75,
+                enhance_lighting=True,
+            )
+            if composite_jpeg:
+                return [{"mime_type": "image/jpeg", "data": composite_jpeg}]
         except Exception as fresh_err:
             app_logger.debug(f"[FRESH VISUAL ERR] {fresh_err}")
 
@@ -495,9 +472,10 @@ def proactive_observer_loop():
             continue
 
         proactive_prompt = (
-            "You are Alpha, a possessive, playful desktop anime companion. "
-            "Look at Antriksh's webcam and screen. "
-            "Make ONE short, spontaneous comment (max 14 words) about what he is doing or listening to."
+            "You are Alpha, a possessive, sharp-witted desktop anime companion glancing over Antriksh's shoulder. "
+            "A composite image of his primary desktop screen with his live webcam in the bottom-right corner is attached. "
+            "Look at what is directly on his screen (code, PDF, homework, browser, video) and his webcam. "
+            "Make ONE short, spontaneous, witty comment (max 14 words) specifically about what he is doing, viewing, or studying."
         )
 
         try:

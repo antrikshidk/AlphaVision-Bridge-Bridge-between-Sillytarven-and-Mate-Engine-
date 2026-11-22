@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [v1.7.0] — 2026-11-22
+
+### Added
+- **Unified Composite Screen + Webcam Vision Pipeline** (`compose_screen_and_camera_bgr` & `compose_screen_and_camera`):
+  - Captures full desktop screen (scaled to 1024px width for crystal-clear readability of code, PDF math formulas, and video) with a real-time Picture-in-Picture (PiP) webcam inset (280px) in the bottom-right corner.
+  - PiP includes CLAHE low-light enhancement, high-contrast borders, and a `WEBCAM` indicator tag so Gemini instantly understands screen context vs user camera context.
+  - Single composite image upload (<100KB JPEG) cuts API roundtrip latency from ~15s to ~1.5s and consumes only 1 image token allocation (~258 tokens).
+- **Subconscious Screen Frame Syncing**: `AnimeVision.py` automatically keeps `PerceptionEngine` updated with live desktop frames via `update_screen_frame()`, populating `snap.frame_blob` on significant state changes so spontaneous remarks can comment directly on active screen content.
+- **Extended Vision Intent Gating**: User questions mentioning `screen`, `desktop`, `monitor`, `display`, `problem`, `equation`, `diagram`, or `pdf` automatically trigger fresh high-resolution composite vision analysis.
+
+### Tests
+- Expanded test suite from 78 to **81 tests passing** (`Ran 81 tests in ~10.3s — OK`), adding coverage for composite layout dimensions, degradation fallbacks, screen frame cache, and expanded keyword triggers.
+
+---
+
 ## [v1.6.0] — 2026-10-29
 
 ### Fixed

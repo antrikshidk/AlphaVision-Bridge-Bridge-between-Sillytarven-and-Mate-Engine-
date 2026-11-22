@@ -590,10 +590,14 @@ class BrainEngine:
             f"Alpha:"
         )
 
-        # Optional: include a frame snapshot blob for visual context
+        # Optional: include a unified composite frame snapshot blob (screen + webcam PiP) for visual context
         parts: List[Any] = [prompt]
         if snap.frame_blob:
-            parts = [{"mime_type": "image/jpeg", "data": snap.frame_blob}, prompt]
+            visual_instruction = (
+                "[VISUAL CONTEXT: A composite image of Antriksh's primary screen with his live webcam inset in the bottom-right corner is attached. "
+                "Observe what is directly visible on his screen—code, formulas, PDF text, videos, tabs—and his posture or actions on camera.]\n"
+            )
+            parts = [{"mime_type": "image/jpeg", "data": snap.frame_blob}, visual_instruction + prompt]
 
         # Low-token (<50 tokens), stream-less generation configuration (<800ms round-trip)
         try:

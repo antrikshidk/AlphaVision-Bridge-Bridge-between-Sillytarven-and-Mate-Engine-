@@ -1032,6 +1032,66 @@ class TestLowLightAndHighResVision(unittest.TestCase):
         self.assertTrue(is_vision_requested("Can you read this book title?"))
         self.assertTrue(is_vision_requested("Check these notes on physics"))
         self.assertTrue(is_vision_requested("Please solve this formula on paper"))
+        self.assertTrue(is_vision_requested("What is on my screen right now?"))
+        self.assertTrue(is_vision_requested("Can you check my desktop monitor?"))
+        self.assertTrue(is_vision_requested("Look at this physics equation and solve it"))
+
+    def test_compose_screen_and_camera_dimensions_and_pip(self):
+        """compose_screen_and_camera_bgr must scale 1080p screen to 1024px width and embed PiP webcam."""
+        import numpy as np
+        from engine.perception import compose_screen_and_camera_bgr, compose_screen_and_camera
+
+        screen = np.full((1080, 1920, 3), 150, dtype=np.uint8)
+        cam = np.full((480, 640, 3), 220, dtype=np.uint8)
+
+        comp_bgr = compose_screen_and_camera_bgr(screen, cam, target_screen_width=1024, pip_width=280)
+        self.assertIsNotNone(comp_bgr)
+        self.assertEqual(comp_bgr.shape, (576, 1024, 3))
+
+        # JPEG encoded output
+        jpeg_bytes = compose_screen_and_camera(screen, cam, target_screen_width=1024, pip_width=280, quality=75)
+        self.assertIsNotNone(jpeg_bytes)
+        self.assertIsInstance(jpeg_bytes, bytes)
+        self.assertGreater(len(jpeg_bytes), 1000)
+
+    def test_compose_screen_and_camera_fallbacks(self):
+        """compose_screen_and_camera must gracefully degrade if either screen or camera is missing."""
+        import numpy as np
+        from engine.perception import compose_screen_and_camera_bgr, compose_screen_and_camera
+
+        # Both None -> None
+        self.assertIsNone(compose_screen_and_camera_bgr(None, None))
+        self.assertIsNone(compose_screen_and_camera(None, None))
+
+        # Screen only (camera offline)
+        screen = np.full((720, 1280, 3), 100, dtype=np.uint8)
+        screen_only = compose_screen_and_camera_bgr(screen, None, target_screen_width=1024)
+        self.assertIsNotNone(screen_only)
+        self.assertEqual(screen_only.shape, (576, 1024, 3))
+
+        # Camera only (headless desktop)
+        cam = np.full((480, 640, 3), 200, dtype=np.uint8)
+        cam_only = compose_screen_and_camera_bgr(None, cam, target_screen_width=1024)
+        self.assertIsNotNone(cam_only)
+        self.assertEqual(cam_only.shape, (480, 640, 3))
+
+    def test_perception_engine_screen_cache_and_composite_blob(self):
+        """PerceptionEngine must cache screen frame and generate unified composite blobs."""
+        import numpy as np
+        from engine.perception import PerceptionEngine
+
+        engine = PerceptionEngine(camera_index=-1)
+        fake_screen = np.full((1080, 1920, 3), 80, dtype=np.uint8)
+        engine.update_screen_frame(fake_screen)
+
+        retrieved = engine.get_latest_screen_frame()
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.shape, (1080, 1920, 3))
+
+        blob = engine.capture_composite_blob(target_screen_width=1024, quality=75)
+        self.assertIsNotNone(blob)
+        self.assertIsInstance(blob, bytes)
+        self.assertGreater(len(blob), 1000)
 
 
 # ---------------------------------------------------------------------------
