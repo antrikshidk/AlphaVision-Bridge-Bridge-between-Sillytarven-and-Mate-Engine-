@@ -137,7 +137,7 @@ MAX_SLIDING_HISTORY = int(os.getenv("MAX_SLIDING_HISTORY", 6))
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.15
 
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY, transport=os.getenv("GEMINI_TRANSPORT", "rest"))
 model = genai.GenerativeModel(
     MODEL_NAME,
     generation_config={"temperature": 0.7, "max_output_tokens": 90}
