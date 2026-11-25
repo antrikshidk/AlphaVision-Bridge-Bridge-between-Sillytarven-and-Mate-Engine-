@@ -149,14 +149,16 @@ class FastGeminiClient:
     """
     Persistent keep-alive HTTP client for Gemini v1beta REST generateContent.
     Reuses pooled TLS sockets, avoids per-turn GenerativeModel instantiation,
-    caps output tokens, and disables hidden thinking overhead (thinkingBudget=0).
+    caps output tokens, disables/minimizes thinking overhead (thinkingLevel=MINIMAL
+    for Gemini 3.5+ / thinkingBudget=0 for legacy), and logs HTTP 4xx/5xx error bodies.
     """
-    def __init__(self, api_key: str, model_name: str, default_max_tokens: int = 75, timeout: float = 12.0):
+    def __init__(self, api_key: str, model_name: str, default_max_tokens: int = 75, timeout: Any = (5.0, 25.0)):
         self.api_key = api_key
         self.model_name = model_name.replace("models/", "")
         self.default_max_tokens = default_max_tokens
         self.timeout = timeout
         self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        self._is_gemini_35_plus = bool(re.search(r"gemini-(?:3\.[5-9]|[4-9]\.)", self.model_name, re.IGNORECASE))
         self._supports_thinking_config = True
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12)
@@ -206,14 +208,18 @@ class FastGeminiClient:
     ) -> _FastGeminiResponse:
         cfg = generation_config or {}
         max_tokens = int(cfg.get("max_output_tokens", self.default_max_tokens))
-        temperature = float(cfg.get("temperature", 0.7))
 
         gen_cfg: Dict[str, Any] = {
-            "temperature": temperature,
             "maxOutputTokens": max_tokens,
         }
+        if not self._is_gemini_35_plus:
+            gen_cfg["temperature"] = float(cfg.get("temperature", 0.7))
+
         if disable_thinking and self._supports_thinking_config:
-            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+            if self._is_gemini_35_plus:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
+            else:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
 
         payload: Dict[str, Any] = {
             "contents": [{"role": "user", "parts": self._to_rest_parts(contents)}],
@@ -229,9 +235,13 @@ class FastGeminiClient:
 
         resp = self._session.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
         if resp.status_code == 400 and "thinking" in resp.text.lower() and "thinkingConfig" in gen_cfg:
+            app_logger.warning(f"[GEMINI API 400] Retrying without thinkingConfig: {resp.text}")
             self._supports_thinking_config = False
             gen_cfg.pop("thinkingConfig", None)
             resp = self._session.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
+
+        if resp.status_code >= 400:
+            app_logger.error(f"[GEMINI API {resp.status_code}] Error body: {resp.text}")
 
         resp.raise_for_status()
         body = resp.json()

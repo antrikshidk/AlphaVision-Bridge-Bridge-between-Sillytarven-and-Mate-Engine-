@@ -1356,7 +1356,7 @@ class TestSharpVisionDeltaAndLatency(unittest.TestCase):
         import AnimeVision
         self.assertFalse(hasattr(AnimeVision, "proactive_observer_loop"))
 
-        # Verify FastGeminiClient session reuse & thinkingConfig fallback
+        # Verify FastGeminiClient session reuse & Gemini 3.5+ thinkingLevel + 4xx logging
         fc = AnimeVision.FastGeminiClient("test-key", "gemini-3.5-flash-lite", default_max_tokens=45)
         ok_resp = MagicMock()
         ok_resp.status_code = 200
@@ -1373,9 +1373,22 @@ class TestSharpVisionDeltaAndLatency(unittest.TestCase):
             sent_headers = post_mock.call_args.kwargs["headers"]
             self.assertEqual(sent_headers["x-goog-api-key"], "test-key")
             self.assertEqual(sent_payload["generationConfig"]["maxOutputTokens"], 45)
-            self.assertEqual(sent_payload["generationConfig"]["thinkingConfig"], {"thinkingBudget": 0})
+            self.assertNotIn("temperature", sent_payload["generationConfig"])
+            self.assertEqual(sent_payload["generationConfig"]["thinkingConfig"], {"thinkingLevel": "MINIMAL"})
             parts = sent_payload["contents"][0]["parts"]
             self.assertTrue(any("inlineData" in p for p in parts))
+
+        # Verify 4xx logs resp.text before raising HTTPError
+        bad_resp = MagicMock()
+        bad_resp.status_code = 400
+        bad_resp.text = '{"error":{"message":"Invalid field xyz"}}'
+        bad_resp.raise_for_status.side_effect = RuntimeError("400 Bad Request")
+        with patch.object(fc._session, "post", return_value=bad_resp), \
+             patch.object(AnimeVision.app_logger, "error") as log_err:
+            with self.assertRaises(RuntimeError):
+                fc.generate_content(["test"])
+            log_err.assert_called_once()
+            self.assertIn("Invalid field xyz", log_err.call_args[0][0])
 
         # Verify casual chat turn ("hi") still attaches cached separate visuals
         client = AnimeVision.app.test_client()
