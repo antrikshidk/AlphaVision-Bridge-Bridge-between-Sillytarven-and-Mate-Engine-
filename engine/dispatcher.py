@@ -123,6 +123,7 @@ class Dispatcher:
         self._last_push: float  = 0.0
         self._last_dispatched_thought: Optional[tuple[str, float]] = None
         self._recent_dispatches: list[tuple[str, float]] = []
+        self._remark_history: deque[tuple[str, float]] = deque(maxlen=6)
         self._spontaneous_enabled: bool = True
 
     # ------------------------------------------------------------------
@@ -194,10 +195,11 @@ class Dispatcher:
                         )
                         return False
 
-            # Passed checks: register dispatch timestamp under lock & update last_dispatched_thought cache
+            # Passed checks: register dispatch timestamp under lock & update caches
             self._last_push = now
             self._last_dispatched_thought = (norm_key, now)
             self._recent_dispatches.append((norm_key, now))
+            self._remark_history.append((clean_remark, now))
 
         t = threading.Thread(
             target=self._deliver,
@@ -298,6 +300,20 @@ class Dispatcher:
     def last_push_time(self) -> float:
         with self._lock:
             return self._last_push
+
+    def get_recent_remarks(self, max_count: int = 5, max_age_sec: float = 900.0) -> list[dict[str, Any]]:
+        """
+        Returns recent spontaneous remarks in chronological order (oldest -> newest)
+        within `max_age_sec` so direct chat turns remember recent desktop bubbles.
+        """
+        now = time.time()
+        with self._lock:
+            recent = [
+                {"text": text, "timestamp": ts, "age_sec": max(0.0, now - ts)}
+                for text, ts in self._remark_history
+                if (now - ts) <= max_age_sec
+            ]
+        return recent[-max_count:] if max_count > 0 else []
 
     def seconds_since_last_push(self) -> float:
         return time.time() - self.last_push_time

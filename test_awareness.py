@@ -1405,6 +1405,60 @@ class TestSharpVisionDeltaAndLatency(unittest.TestCase):
             sent_chat_parts = mock_chat_model.generate_content.call_args[0][0]
             self.assertIn({"mime_type": "image/jpeg", "data": b"scrbytes"}, sent_chat_parts)
 
+    def test_chat_bridge_tokens_450_sse_logging_and_dispatcher_history(self):
+        """Chat bridge must log POST path/keys, use 450 tokens, parse OpenAI messages cleanly, inject Dispatcher history, and support SSE."""
+        import AnimeVision
+        from engine.dispatcher import Dispatcher
+
+        self.assertEqual(AnimeVision.model.default_max_tokens, 450)
+        self.assertEqual(AnimeVision.brain_fast_model.default_max_tokens, 45)
+
+        disp = Dispatcher(mateengine_port=19996, shared_thought_queue=queue.Queue(), min_interval_sec=0.0)
+        disp.push("Matrix math and YouTube dogs? Pick a lane, Antriksh.")
+        history = disp.get_recent_remarks()
+        self.assertEqual(len(history), 1)
+        self.assertIn("Matrix math", history[0]["text"])
+
+        client = AnimeVision.app.test_client()
+        mock_chat_model = MagicMock()
+        mock_chat_model.generate_content.return_value = MagicMock(
+            text="Let's integrate sqrt(1+sin(2x)) = |sin x + cos x| from 0 to pi/4, which equals 1."
+        )
+
+        payload = {
+            "stream": True,
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "system", "content": "Persona prompt"},
+                {"role": "user", "content": [{"type": "text", "text": "ans of 22"}]},
+                {"role": "system", "content": "[Write the next reply only as Alpha.]"},
+            ],
+        }
+
+        with patch.object(AnimeVision, "get_cached_visuals", return_value=[]) as _, \
+             patch.object(AnimeVision, "model", mock_chat_model), \
+             patch.object(AnimeVision, "_awareness_dispatcher", disp), \
+             patch.object(AnimeVision, "send_to_mateengine"), \
+             patch.object(AnimeVision.app_logger, "info") as info_mock:
+            resp = client.post("/chat", json=payload)
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text/event-stream", resp.content_type)
+            raw_sse = resp.get_data(as_text=True)
+            self.assertIn("data: [DONE]", raw_sse)
+            self.assertIn("sqrt(1+sin(2x))", raw_sse)
+
+            # Verify max_output_tokens=450 & extracted user message & injected Dispatcher remark
+            call_kwargs = mock_chat_model.generate_content.call_args.kwargs
+            self.assertEqual(call_kwargs["generation_config"]["max_output_tokens"], 450)
+            sys_prompt = call_kwargs["system_instruction"]
+            self.assertIn("Matrix math and YouTube dogs?", sys_prompt)
+            prompt_text = mock_chat_model.generate_content.call_args[0][0][-1]
+            self.assertIn("ans of 22", prompt_text)
+
+            # Verify incoming path & payload keys were logged
+            logged_msgs = [str(c[0][0]) for c in info_mock.call_args_list if c[0]]
+            self.assertTrue(any("[CHAT INCOMING] POST /chat" in m and "keys=" in m for m in logged_msgs))
+
 
 if __name__ == "__main__":
     print("=" * 60)

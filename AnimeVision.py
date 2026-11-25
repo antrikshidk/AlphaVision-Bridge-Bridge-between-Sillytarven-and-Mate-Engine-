@@ -254,7 +254,7 @@ class FastGeminiClient:
 
 
 genai.configure(api_key=GEMINI_API_KEY, transport=os.getenv("GEMINI_TRANSPORT", "rest"))
-model = FastGeminiClient(GEMINI_API_KEY, MODEL_NAME, default_max_tokens=75)
+model = FastGeminiClient(GEMINI_API_KEY, MODEL_NAME, default_max_tokens=450)
 brain_fast_model = FastGeminiClient(GEMINI_API_KEY, MODEL_NAME, default_max_tokens=45)
 
 app = Flask(__name__)
@@ -757,8 +757,24 @@ def get_models():
     })
 
 
+def _extract_message_text(content: Any) -> str:
+    """Extracts plain text from either string or OpenAI multimodal content list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text", "")))
+        return " ".join(p.strip() for p in parts if p and p.strip())
+    return str(content) if content is not None else ""
+
+
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 @app.route('/chat/completions', methods=['POST', 'OPTIONS'])
+@app.route('/chat', methods=['POST', 'OPTIONS'])
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 @app.route('/api/plugins/mateengine-chat/chat', methods=['POST', 'OPTIONS'])
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET', 'OPTIONS'])
@@ -775,22 +791,41 @@ def universal_chat_bridge(path=""):
     t_start = time.time()
 
     data = request.get_json(force=True, silent=True) or {}
-    is_streaming = data.get('stream', False)
+    is_streaming = bool(data.get('stream', False))
     req_model = data.get('model', 'gpt-3.5-turbo')
+
+    payload_keys = sorted(data.keys()) if isinstance(data, dict) else []
+    raw_messages = data.get('messages')
+    msg_count = len(raw_messages) if isinstance(raw_messages, list) else 0
+    app_logger.info(
+        f"[CHAT INCOMING] POST {request.path} | keys={payload_keys} | stream={is_streaming} | messages={msg_count}"
+    )
 
     try:
         user_msg = "hello"
         messages = data.get('messages', [])
         if messages and isinstance(messages, list):
-            last_item = messages[-1]
-            if isinstance(last_item, dict):
-                user_msg = last_item.get('content', 'hello')
+            chosen = None
+            for item in reversed(messages):
+                if isinstance(item, dict) and item.get('role') == 'user':
+                    chosen = item.get('content', '')
+                    break
+            if chosen is not None:
+                user_msg = _extract_message_text(chosen)
             else:
-                user_msg = str(last_item)
+                last_item = messages[-1]
+                if isinstance(last_item, dict):
+                    user_msg = _extract_message_text(last_item.get('content', 'hello'))
+                else:
+                    user_msg = str(last_item)
         elif 'message' in data:
-            user_msg = str(data['message'])
+            user_msg = _extract_message_text(data['message'])
         elif 'text' in data:
-            user_msg = str(data['text'])
+            user_msg = _extract_message_text(data['text'])
+        elif 'prompt' in data:
+            user_msg = _extract_message_text(data['prompt'])
+        elif 'query' in data:
+            user_msg = _extract_message_text(data['query'])
 
         # 1. Stop Leaking Context: Strip any prepended [Context: ...] so user message is raw and clean
         user_msg = re.sub(r'\[Context:[^\]]*\][\s.:-]*', '', str(user_msg)).strip()
@@ -810,11 +845,30 @@ def universal_chat_bridge(path=""):
         # Check short-term ambient context (Dual-Channel Memory within 90s)
         poke = get_last_ambient_poke()
         ambient_context = ""
+        last_poke_norm = ""
         if poke and (time.time() - poke.get("timestamp", 0)) <= 90.0:
             poke_text = poke.get("text", "")
             if poke_text:
                 ambient_context = f'You recently remarked to Antriksh: "{poke_text}". He just opened the chat to respond.'
+                last_poke_norm = " ".join(poke_text.lower().split())
             clear_last_ambient_poke()
+
+        # Pull recent spontaneous Dispatcher remarks so Alpha remembers recent desktop bubbles
+        spontaneous_history_lines: List[str] = []
+        if _awareness_dispatcher is not None and hasattr(_awareness_dispatcher, "get_recent_remarks"):
+            try:
+                for entry in _awareness_dispatcher.get_recent_remarks(max_count=5, max_age_sec=900.0):
+                    r_text = str(entry.get("text", "")).strip()
+                    if not r_text:
+                        continue
+                    r_norm = " ".join(r_text.lower().split())
+                    if last_poke_norm and r_norm == last_poke_norm:
+                        continue
+                    age_s = int(entry.get("age_sec", 0))
+                    age_label = f"{age_s}s ago" if age_s < 60 else f"{age_s // 60}m ago"
+                    spontaneous_history_lines.append(f'- ({age_label}) "{r_text}"')
+            except Exception:
+                pass
 
         with memory_lock:
             recent_transcript = "\n".join(
@@ -829,7 +883,7 @@ def universal_chat_bridge(path=""):
             "CRITICAL INSTRUCTIONS FOR CHAT INPUT ROUTING:",
             "1. Respond directly, conversationally, and naturally to Antriksh's typed message.",
             "2. Ground visual references strictly in what is visible in the attached screen/webcam pixels—use them naturally whenever helpful, without hijacking his topic.",
-            "3. Reply in 1-2 short, punchy sentences.",
+            "3. Keep casual banter to 1-2 short, punchy sentences, OR give a complete, clear step-by-step solution when Antriksh asks a math/code/homework question on screen.",
             "DESKTOP ACTIONS (only use when explicitly asked to control PC/media):",
             "- [[ACTION: media, playpause]] / [[ACTION: media, next]] / [[ACTION: media, prev]]",
             "- [[ACTION: media, volup]] / [[ACTION: media, voldown]]",
@@ -837,6 +891,11 @@ def universal_chat_bridge(path=""):
             "- [[ACTION: hotkey, win+d]] / [[ACTION: hotkey, ctrl+t]] / [[ACTION: hotkey, ctrl+w]]",
             "- [[ACTION: type, text]] / [[ACTION: press, enter]]",
         ]
+        if spontaneous_history_lines:
+            system_instruction_lines.append(
+                "[Recent Spontaneous Desktop Remarks You Just Said (remember if Antriksh replies to them):]\n"
+                + "\n".join(spontaneous_history_lines)
+            )
         if ambient_context:
             system_instruction_lines.append(f"[Ambient Memory Context: {ambient_context}]")
         system_instruction_str = "\n".join(system_instruction_lines)
@@ -856,7 +915,7 @@ def universal_chat_bridge(path=""):
             response = model.generate_content(
                 gemini_payload,
                 system_instruction=system_instruction_str,
-                generation_config={"temperature": 0.7, "max_output_tokens": 75},
+                generation_config={"temperature": 0.7, "max_output_tokens": 450},
             )
             if response and hasattr(response, "text") and response.text:
                 answer = process_actions_and_clean_text(response.text.strip())
@@ -864,7 +923,10 @@ def universal_chat_bridge(path=""):
             app_logger.warning(f"[CHAT LLM WARN] System instruction call failed, falling back: {e}")
             try:
                 fallback_payload = visuals + [f"{system_instruction_str}\n\n{user_content_str}"] if visuals else [f"{system_instruction_str}\n\n{user_content_str}"]
-                response = model.generate_content(fallback_payload)
+                response = model.generate_content(
+                    fallback_payload,
+                    generation_config={"temperature": 0.7, "max_output_tokens": 450},
+                )
                 if response and hasattr(response, "text") and response.text:
                     answer = process_actions_and_clean_text(response.text.strip())
             except Exception as e2:
@@ -906,8 +968,13 @@ def universal_chat_bridge(path=""):
                 },
                 daemon=True
             ).start()
-            # Auto-dismiss any lingering user bubble on MateEngine desktop
-            schedule_bubble_auto_dismiss(delay_sec=5.0)
+            # Auto-dismiss bubble scaled by word count (min 5s, max 18s) so longer answers stay readable
+            dismiss_delay = max(5.0, min(18.0, len(to_dispatch_now.split()) * 0.4))
+            schedule_bubble_auto_dismiss(delay_sec=dismiss_delay)
+
+        app_logger.info(
+            f"[CHAT RESPONSE SENT] mode={'sse' if is_streaming else 'json'} chars={len(final_delivery)}"
+        )
 
         if not is_streaming:
             return jsonify({
