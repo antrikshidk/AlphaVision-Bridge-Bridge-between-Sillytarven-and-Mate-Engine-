@@ -17,14 +17,16 @@ No raw frames are ever forwarded externally; only computed state deltas.
 from __future__ import annotations
 
 import ctypes
+import io
 import os
 import sys
 import time
 import threading
 import queue
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
@@ -488,8 +490,136 @@ class PerceptionSnapshot:
     is_late_night: bool = False        # 22:00–05:00
     is_work_hours: bool = False        # 09:00–18:00
 
-    # Snapshot blob (downscaled JPEG bytes) — only set on major state changes
+    # Snapshot blob (downscaled JPEG bytes) — legacy unified field retained for compatibility
     frame_blob: Optional[bytes] = None  # raw JPEG bytes, never the full frame
+
+    # Separate high-definition visual blobs (screen + webcam + optional active ROI crop)
+    screen_blob: Optional[bytes] = None
+    cam_blob: Optional[bytes] = None
+    focus_crop_blob: Optional[bytes] = None
+
+    # Visual change / attention telemetry
+    screen_delta: float = 0.0
+    cam_delta: float = 0.0
+    screen_phash_dist: int = 0
+    visual_trigger_reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# In-Memory JPEG Encoding, Perceptual Hash & Dynamic Cursor/Window ROI Crop
+# ---------------------------------------------------------------------------
+def _encode_jpeg_bytesio(frame_bgr: Optional[np.ndarray], quality: int = 85) -> Optional[bytes]:
+    """Encodes a BGR ndarray to JPEG strictly in memory via io.BytesIO (zero disk I/O)."""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None
+    try:
+        ok, encoded = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            return None
+        buf = io.BytesIO(encoded.tobytes())
+        return buf.getvalue()
+    except Exception as exc:
+        logger.debug("[PERCEPTION] _encode_jpeg_bytesio error: %s", exc)
+        return None
+
+
+def compute_dhash64(frame_bgr: Optional[np.ndarray]) -> int:
+    """Computes a fast 64-bit difference hash (dHash) over a 9x8 grayscale thumbnail."""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return 0
+    small = cv2.resize(frame_bgr, (9, 8), interpolation=cv2.INTER_AREA)
+    if len(small.shape) == 3:
+        small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    diff = small[:, 1:] > small[:, :-1]
+    bits = 0
+    for bit in diff.flatten():
+        bits = (bits << 1) | int(bool(bit))
+    return bits
+
+
+def hamming_distance64(h1: int, h2: int) -> int:
+    """Hamming distance between two 64-bit dHashes."""
+    return bin((h1 ^ h2) & ((1 << 64) - 1)).count("1")
+
+
+def _detect_small_text_or_errors(screen_bgr: Optional[np.ndarray], activity_tag: str = "misc") -> bool:
+    """
+    Fast heuristic checking whether the screen contains dense small text
+    (IDE/PDF/terminal) or red error highlights warranting a native high-res ROI crop.
+    """
+    if screen_bgr is None or screen_bgr.size == 0:
+        return False
+    sh, sw = screen_bgr.shape[:2]
+    if sw <= 1280:
+        return False
+    if activity_tag in ("coding", "terminal", "reading", "study", "physics"):
+        return True
+    try:
+        thumb = cv2.resize(screen_bgr, (320, 180), interpolation=cv2.INTER_AREA)
+        b, g, r = cv2.split(thumb)
+        red_mask = (r > 165) & ((r.astype(np.int16) - np.maximum(g, b).astype(np.int16)) > 65)
+        if float(np.mean(red_mask)) > 0.008:
+            return True
+        gray = cv2.cvtColor(thumb, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Laplacian(gray, cv2.CV_16S, ksize=1)
+        edge_density = float(np.mean(np.abs(edges) > 22))
+        return edge_density > 0.14
+    except Exception:
+        return False
+
+
+def extract_focus_roi_crop(
+    screen_bgr: Optional[np.ndarray],
+    crop_w: int = 768,
+    crop_h: int = 512,
+) -> Optional[np.ndarray]:
+    """
+    Extracts a native-resolution (un-downscaled) crop around the cursor or active
+    foreground window so small code, formulas, and error logs remain razor-sharp.
+    """
+    if screen_bgr is None or screen_bgr.size == 0:
+        return None
+    sh, sw = screen_bgr.shape[:2]
+    if sw <= crop_w and sh <= crop_h:
+        return None
+
+    cw = min(crop_w, sw)
+    ch = min(crop_h, sh)
+    cx_px, cy_px = sw // 2, sh // 2
+
+    if _WIN32_AVAILABLE:
+        try:
+            prim_w = max(1, int(win32api.GetSystemMetrics(0)))
+            prim_h = max(1, int(win32api.GetSystemMetrics(1)))
+            scale_x = sw / float(prim_w)
+            scale_y = sh / float(prim_h)
+
+            used_cursor = False
+            get_cursor = getattr(win32gui, "GetCursorPos", None)
+            if callable(get_cursor):
+                vx, vy = get_cursor()
+                if 0 <= vx < prim_w and 0 <= vy < prim_h:
+                    cx_px = int(vx * scale_x)
+                    cy_px = int(vy * scale_y)
+                    used_cursor = True
+
+            if not used_cursor:
+                get_fg = getattr(win32gui, "GetForegroundWindow", None)
+                get_rect = getattr(win32gui, "GetWindowRect", None)
+                if callable(get_fg) and callable(get_rect):
+                    hwnd = get_fg()
+                    if hwnd:
+                        l, t, r, b = get_rect(hwnd)
+                        if r > l and b > t:
+                            cx_px = int(((l + r) * 0.5) * scale_x)
+                            cy_px = int((t + (b - t) * 0.4) * scale_y)
+        except Exception:
+            pass
+
+    x1 = max(0, min(sw - cw, cx_px - cw // 2))
+    y1 = max(0, min(sh - ch, cy_px - ch // 2))
+    crop = screen_bgr[y1 : y1 + ch, x1 : x1 + cw]
+    return crop.copy() if crop.size > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -789,13 +919,26 @@ class PerceptionEngine:
         self._face_present_since: Optional[float] = None
         self._prev_ear: float = 0.3
         self._frame_counter: int = 0
+        self._last_cam_delta: float = 0.0
+        self._last_face_area_ratio: float = 0.0
+        self._last_cam_motion_reason: str = ""
 
         # Haar fallback
         self._haar_cascade: Optional[cv2.CascadeClassifier] = None
 
-        # Thread-safe screen frame pointer for unified multimodal composite captures
+        # Thread-safe screen frame pointer & delta trackers
         self._screen_lock = threading.Lock()
         self._latest_screen_frame: Optional[np.ndarray] = None
+        self._prev_screen_thumb: Optional[np.ndarray] = None
+        self._prev_screen_dhash: Optional[int] = None
+        self._prev_screen_red_ratio: float = 0.0
+        self._internal_grabber: Optional[SafeScreenGrabber] = None
+
+        # Persistent worker pool for parallel screen/cam/ROI capture & encoding
+        self._io_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="PerceptionVisionIO",
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -816,6 +959,15 @@ class PerceptionEngine:
             self.camera_worker.stop()
         if self._thread:
             self._thread.join(timeout=5.0)
+        try:
+            self._io_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        if self._internal_grabber is not None:
+            try:
+                self._internal_grabber.close()
+            except Exception:
+                pass
         logger.info("[PERCEPTION] Sensory loop stopped.")
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
@@ -876,13 +1028,40 @@ class PerceptionEngine:
                 # Build snapshot from frame + OS sensors (runs smoothly with or without camera)
                 snap = self._build_snapshot(frame, face_mesh_ctx)
 
-                # Only enqueue if meaningful change OR 10-s heartbeat
+                # Grab latest screen frame (or non-flickering fallback) & evaluate deltas
+                screen_bgr = self.get_latest_screen_frame()
+                if screen_bgr is None and _WIN32_AVAILABLE:
+                    if self._internal_grabber is None:
+                        self._internal_grabber = SafeScreenGrabber(min_interval_sec=0.65)
+                    screen_bgr = self._internal_grabber.grab_bgr()
+                    if screen_bgr is not None:
+                        self.update_screen_frame(screen_bgr)
+
+                scr_delta, ph_dist, scr_reason = self._evaluate_screen_delta(screen_bgr)
+                snap.screen_delta = scr_delta
+                snap.screen_phash_dist = ph_dist
+                snap.cam_delta = self._last_cam_delta
+                if scr_reason:
+                    snap.visual_trigger_reason = scr_reason
+                elif self._last_cam_motion_reason:
+                    snap.visual_trigger_reason = self._last_cam_motion_reason
+
+                # Only enqueue if meaningful change, visual delta, OR 10-s heartbeat
                 if self._is_significant_change(snap):
-                    if snap.frame_blob is None:
-                        try:
-                            snap.frame_blob = self.capture_composite_blob()
-                        except Exception as comp_err:
-                            logger.debug("[PERCEPTION] Composite snapshot capture in loop: %s", comp_err)
+                    try:
+                        blobs = self.capture_separate_blobs(
+                            screen_bgr=screen_bgr,
+                            cam_bgr=frame,
+                            include_roi="auto",
+                            activity_tag=tag_window(snap.active_window),
+                        )
+                        snap.screen_blob = blobs.get("screen_blob")
+                        snap.cam_blob = blobs.get("cam_blob")
+                        snap.focus_crop_blob = blobs.get("focus_crop_blob")
+                        if snap.frame_blob is None:
+                            snap.frame_blob = snap.screen_blob or snap.cam_blob
+                    except Exception as cap_err:
+                        logger.debug("[PERCEPTION] Parallel snapshot capture in loop: %s", cap_err)
                     if not self.snapshot_queue.full():
                         self.snapshot_queue.put(snap)
                     self._prev_snapshot = snap
@@ -964,12 +1143,16 @@ class PerceptionEngine:
             gray_thumb = cv2.cvtColor(gray_thumb, cv2.COLOR_BGR2GRAY)
 
         motion_detected = True
+        cam_diff = 0.0
         if self._prev_gray_thumb is not None and self._prev_snapshot is not None:
             diff = cv2.absdiff(gray_thumb, self._prev_gray_thumb)
-            if np.mean(diff) < 2.0:
+            cam_diff = float(np.mean(diff))
+            if cam_diff < 2.0:
                 motion_detected = False
 
         self._prev_gray_thumb = gray_thumb
+        self._last_cam_delta = cam_diff
+        self._last_cam_motion_reason = ""
 
         if not motion_detected and self._prev_snapshot is not None:
             # Re-use previous face orientation without running CV
@@ -979,6 +1162,9 @@ class PerceptionEngine:
             snap.head_yaw      = self._prev_snapshot.head_yaw
             snap.fatigue_cue   = False
             return snap
+
+        if cam_diff >= 8.5:
+            self._last_cam_motion_reason = "cam_motion"
 
         rgb = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
 
@@ -991,8 +1177,16 @@ class PerceptionEngine:
                 snap.eye_contact  = _detect_eye_contact(lms, iw, ih)
                 fatigued, self._prev_ear = _detect_fatigue_blink(lms, self._prev_ear)
                 snap.fatigue_cue  = fatigued
+
+                xs = [p.x for p in lms.landmark]
+                ys = [p.y for p in lms.landmark]
+                area_ratio = max(0.0, (max(xs) - min(xs)) * (max(ys) - min(ys)))
+                if self._last_face_area_ratio > 0.02 and area_ratio > self._last_face_area_ratio * 1.32:
+                    self._last_cam_motion_reason = "face_closer"
+                self._last_face_area_ratio = area_ratio
             else:
                 snap.face_detected = False
+                self._last_face_area_ratio = 0.0
         else:
             # Fast Haar fallback on downscaled frame
             if self._haar_cascade is not None:
@@ -1030,8 +1224,42 @@ class PerceptionEngine:
         return snap
 
     # ------------------------------------------------------------------
-    # Significance gate — avoid flooding brain with identical state
+    # Significance gate & delta evaluation
     # ------------------------------------------------------------------
+    def _evaluate_screen_delta(self, screen_bgr: Optional[np.ndarray]) -> Tuple[float, int, str]:
+        """Measures screen layout/error delta via 32x18 luma absdiff, 64-bit dHash, and red-error ratio."""
+        if screen_bgr is None or screen_bgr.size == 0:
+            return 0.0, 0, ""
+        try:
+            thumb_bgr = cv2.resize(screen_bgr, (32, 18), interpolation=cv2.INTER_AREA)
+            thumb_gray = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2GRAY)
+            curr_dhash = compute_dhash64(screen_bgr)
+
+            b, g, r = cv2.split(thumb_bgr)
+            red_ratio = float(np.mean((r > 165) & ((r.astype(np.int16) - np.maximum(g, b).astype(np.int16)) > 65)))
+
+            diff_mean = 0.0
+            dhash_dist = 0
+            reason = ""
+
+            if self._prev_screen_thumb is not None:
+                diff_mean = float(np.mean(cv2.absdiff(thumb_gray, self._prev_screen_thumb)))
+            if self._prev_screen_dhash is not None:
+                dhash_dist = hamming_distance64(curr_dhash, self._prev_screen_dhash)
+
+            if (red_ratio - self._prev_screen_red_ratio) > 0.008 and red_ratio > 0.012:
+                reason = "error_flash"
+            elif dhash_dist >= 6 or diff_mean >= 4.5:
+                reason = "screen_delta"
+
+            self._prev_screen_thumb = thumb_gray
+            self._prev_screen_dhash = curr_dhash
+            self._prev_screen_red_ratio = red_ratio
+            return diff_mean, dhash_dist, reason
+        except Exception as exc:
+            logger.debug("[PERCEPTION] _evaluate_screen_delta error: %s", exc)
+            return 0.0, 0, ""
+
     def _is_significant_change(self, snap: PerceptionSnapshot) -> bool:
         prev = self._prev_snapshot
         if prev is None:
@@ -1046,6 +1274,8 @@ class PerceptionEngine:
             return True
         # Large head-pose shift (>15°)
         if abs(snap.head_yaw - prev.head_yaw) > 15 or abs(snap.head_pitch - prev.head_pitch) > 15:
+            return True
+        if snap.visual_trigger_reason or snap.screen_delta >= 4.5 or snap.cam_delta >= 8.5:
             return True
         return False
 
@@ -1106,6 +1336,86 @@ class PerceptionEngine:
         """Thread-safe retrieval of the latest desktop screen frame."""
         with self._screen_lock:
             return self._latest_screen_frame.copy() if self._latest_screen_frame is not None else None
+
+    def capture_separate_blobs(
+        self,
+        screen_bgr: Optional[np.ndarray] = None,
+        cam_bgr: Optional[np.ndarray] = None,
+        screen_max_width: int = 1600,
+        screen_quality: int = 85,
+        cam_width: int = 640,
+        cam_quality: int = 85,
+        include_roi: Any = "auto",
+        roi_quality: int = 88,
+        enhance_lighting: bool = True,
+        activity_tag: str = "misc",
+    ) -> Dict[str, Optional[bytes]]:
+        """
+        Captures and JPEG-encodes separate sharp frames concurrently in memory (io.BytesIO):
+          - Full desktop screen (up to 1600x900, quality=85)
+          - Clean webcam frame (640x480, quality=85, conditional low-light CLAHE boost)
+          - Optional native-resolution 768x512 cursor/window ROI crop when small text/errors exist
+        """
+        if cam_bgr is None:
+            cam_bgr = self.get_latest_frame()
+        if screen_bgr is None:
+            screen_bgr = self.get_latest_screen_frame()
+        if screen_bgr is None and _WIN32_AVAILABLE:
+            if self._internal_grabber is None:
+                self._internal_grabber = SafeScreenGrabber(min_interval_sec=0.25)
+            screen_bgr = self._internal_grabber.grab_bgr(force=True)
+
+        def _prep_screen() -> Optional[bytes]:
+            if screen_bgr is None or screen_bgr.size == 0:
+                return None
+            sh, sw = screen_bgr.shape[:2]
+            proc = screen_bgr
+            if sw > screen_max_width and sw > 0:
+                scale = screen_max_width / float(sw)
+                proc = cv2.resize(
+                    screen_bgr,
+                    (screen_max_width, max(1, int(sh * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            return _encode_jpeg_bytesio(proc, quality=screen_quality)
+
+        def _prep_cam() -> Optional[bytes]:
+            if cam_bgr is None or cam_bgr.size == 0:
+                return None
+            ch, cw = cam_bgr.shape[:2]
+            proc = cam_bgr
+            if enhance_lighting:
+                proc = enhance_low_light(proc)
+            if cw > cam_width and cw > 0:
+                scale = cam_width / float(cw)
+                proc = cv2.resize(
+                    proc,
+                    (cam_width, max(1, int(ch * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            return _encode_jpeg_bytesio(proc, quality=cam_quality)
+
+        def _prep_roi() -> Optional[bytes]:
+            if screen_bgr is None or screen_bgr.size == 0:
+                return None
+            want_roi = (
+                True if include_roi is True
+                else (_detect_small_text_or_errors(screen_bgr, activity_tag) if include_roi == "auto" else False)
+            )
+            if not want_roi:
+                return None
+            crop = extract_focus_roi_crop(screen_bgr)
+            return _encode_jpeg_bytesio(crop, quality=roi_quality)
+
+        fut_scr = self._io_executor.submit(_prep_screen)
+        fut_cam = self._io_executor.submit(_prep_cam)
+        fut_roi = self._io_executor.submit(_prep_roi)
+
+        return {
+            "screen_blob": fut_scr.result(),
+            "cam_blob": fut_cam.result(),
+            "focus_crop_blob": fut_roi.result(),
+        }
 
     def capture_composite_blob(
         self,

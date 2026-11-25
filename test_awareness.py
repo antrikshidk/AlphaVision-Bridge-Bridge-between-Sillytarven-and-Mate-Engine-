@@ -1214,6 +1214,185 @@ class TestConfigSyncAndSpontaneousToggle(unittest.TestCase):
         self.assertTrue(AnimeVision._spontaneous_pokes_enabled)
 
 
+# ---------------------------------------------------------------------------
+# 20. Sharp Separate Frames, Visual Delta Triggers & Fast Client Tests
+# ---------------------------------------------------------------------------
+class TestSharpVisionDeltaAndLatency(unittest.TestCase):
+
+    def test_capture_separate_blobs_dimensions_no_stitching(self):
+        """capture_separate_blobs must output distinct 1600x900 screen, 640x480 cam, and 768x512 ROI crop."""
+        import cv2
+        import numpy as np
+        from engine.perception import PerceptionEngine
+
+        engine = PerceptionEngine(camera_index=-1)
+        screen = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        cam = np.full((480, 640, 3), 200, dtype=np.uint8)
+
+        blobs = engine.capture_separate_blobs(
+            screen_bgr=screen,
+            cam_bgr=cam,
+            screen_max_width=1600,
+            screen_quality=85,
+            cam_width=640,
+            cam_quality=85,
+            include_roi=True,
+        )
+        engine.stop()
+
+        self.assertIsNotNone(blobs["screen_blob"])
+        self.assertIsNotNone(blobs["cam_blob"])
+        self.assertIsNotNone(blobs["focus_crop_blob"])
+
+        dec_scr = cv2.imdecode(np.frombuffer(blobs["screen_blob"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        dec_cam = cv2.imdecode(np.frombuffer(blobs["cam_blob"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        dec_roi = cv2.imdecode(np.frombuffer(blobs["focus_crop_blob"], dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        self.assertEqual(dec_scr.shape, (900, 1600, 3))
+        self.assertEqual(dec_cam.shape, (480, 640, 3))
+        self.assertEqual(dec_roi.shape, (512, 768, 3))
+
+    def test_screen_delta_and_error_flash_detection(self):
+        """Identical screens produce 0 delta; layout change or red error spike triggers immediately."""
+        import numpy as np
+        from engine.perception import PerceptionEngine
+
+        engine = PerceptionEngine(camera_index=-1)
+        scr1 = np.full((720, 1280, 3), 40, dtype=np.uint8)
+        d1, h1, r1 = engine._evaluate_screen_delta(scr1)
+        self.assertEqual(d1, 0.0)
+        self.assertEqual(r1, "")
+
+        # Static frame -> zero delta
+        d2, h2, r2 = engine._evaluate_screen_delta(scr1.copy())
+        self.assertEqual(d2, 0.0)
+        self.assertEqual(h2, 0)
+        self.assertEqual(r2, "")
+
+        # Simulated bright red error banner on screen
+        scr_err = scr1.copy()
+        scr_err[300:650, 100:1100] = (10, 10, 235)  # BGR bright red
+        d3, h3, r3 = engine._evaluate_screen_delta(scr_err)
+        engine.stop()
+        self.assertEqual(r3, "error_flash")
+        self.assertGreater(d3, 4.5)
+
+    def test_brain_refuses_text_only_when_require_vision_and_attaches_all_parts(self):
+        """With require_vision=True, empty frames abort without calling Gemini; live frames attach 3 separate parts."""
+        from engine.brain import BrainEngine
+        from engine.perception import PerceptionSnapshot
+
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = MagicMock(text="TypeError on line 42 again?")
+
+        # 1. Missing visuals -> must abort without calling mock_model
+        brain_no_vis = BrainEngine(
+            queue.Queue(),
+            MagicMock(),
+            mock_model,
+            visual_fetcher=lambda include_roi=True: {},
+            require_vision=True,
+        )
+        res_empty = brain_no_vis._generate_remark("screen_error_flash", PerceptionSnapshot(active_window="VSCode"))
+        self.assertIsNone(res_empty)
+        self.assertFalse(mock_model.generate_content.called)
+
+        # 2. Separate live blobs -> must attach all 3 separate JPEG image parts
+        fake_blobs = {
+            "screen_blob": b"\xff\xd8screen",
+            "cam_blob": b"\xff\xd8cam",
+            "focus_crop_blob": b"\xff\xd8roi",
+        }
+        brain_vis = BrainEngine(
+            queue.Queue(),
+            MagicMock(),
+            mock_model,
+            visual_fetcher=lambda include_roi=True: fake_blobs,
+            require_vision=True,
+        )
+        res_ok = brain_vis._generate_remark("screen_error_flash", PerceptionSnapshot(active_window="VSCode"))
+        self.assertEqual(res_ok, "TypeError on line 42 again?")
+        self.assertTrue(mock_model.generate_content.called)
+        sent_parts = mock_model.generate_content.call_args[0][0]
+        img_blobs = [p["data"] for p in sent_parts if isinstance(p, dict) and "data" in p]
+        self.assertEqual(img_blobs, [b"\xff\xd8screen", b"\xff\xd8cam", b"\xff\xd8roi"])
+
+    def test_brain_visual_delta_trigger_and_static_suppression(self):
+        """Visual delta fires immediately past cooldown and clears _has_unseen_visual_change once spoken."""
+        from engine.brain import BrainEngine, VISUAL_ATTENTION_COOLDOWN
+        from engine.perception import PerceptionSnapshot
+
+        delivered = []
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = MagicMock(text="Red traceback right in front of you.")
+        brain = BrainEngine(
+            queue.Queue(),
+            lambda r: delivered.append(r),
+            mock_model,
+            visual_fetcher=lambda include_roi=True: {"screen_blob": b"scr", "cam_blob": b"cam"},
+            require_vision=True,
+        )
+        brain._state.last_speech_timestamp = time.time() - (VISUAL_ATTENTION_COOLDOWN + 10)
+        brain._last_snap = PerceptionSnapshot(presence=True, eye_contact=False)
+
+        delta_snap = PerceptionSnapshot(
+            presence=True,
+            eye_contact=False,
+            screen_delta=12.0,
+            visual_trigger_reason="error_flash",
+            screen_blob=b"scr",
+        )
+        brain._process_snapshot(delta_snap)
+        deadline = time.time() + 3.0
+        while not delivered and time.time() < deadline:
+            time.sleep(0.05)
+        brain.stop()
+
+        self.assertTrue(len(delivered) > 0)
+        self.assertFalse(brain._has_unseen_visual_change)
+
+    def test_unified_brain_always_on_chat_vision_and_fast_client(self):
+        """AnimeVision must drop proactive_observer_loop, attach cached visuals on casual chat, and support FastGeminiClient."""
+        import AnimeVision
+        self.assertFalse(hasattr(AnimeVision, "proactive_observer_loop"))
+
+        # Verify FastGeminiClient session reuse & thinkingConfig fallback
+        fc = AnimeVision.FastGeminiClient("test-key", "gemini-3.5-flash-lite", default_max_tokens=45)
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.json.return_value = {"candidates": [{"content": {"parts": [{"text": "Nice syntax error."}]}}]}
+        ok_resp.raise_for_status = MagicMock()
+
+        with patch.object(fc._session, "post", return_value=ok_resp) as post_mock:
+            out = fc.generate_content(
+                ["[LIVE SCREEN]", {"mime_type": "image/jpeg", "data": b"abc"}, "hello"],
+                system_instruction="Be concise.",
+            )
+            self.assertEqual(out.text, "Nice syntax error.")
+            sent_payload = post_mock.call_args.kwargs["json"]
+            sent_headers = post_mock.call_args.kwargs["headers"]
+            self.assertEqual(sent_headers["x-goog-api-key"], "test-key")
+            self.assertEqual(sent_payload["generationConfig"]["maxOutputTokens"], 45)
+            self.assertEqual(sent_payload["generationConfig"]["thinkingConfig"], {"thinkingBudget": 0})
+            parts = sent_payload["contents"][0]["parts"]
+            self.assertTrue(any("inlineData" in p for p in parts))
+
+        # Verify casual chat turn ("hi") still attaches cached separate visuals
+        client = AnimeVision.app.test_client()
+        cached_parts = ["[LIVE SCREEN (1600x900)]", {"mime_type": "image/jpeg", "data": b"scrbytes"}]
+        mock_chat_model = MagicMock()
+        mock_chat_model.generate_content.return_value = MagicMock(text="Hey there, busy coding?")
+
+        with patch.object(AnimeVision, "get_cached_visuals", return_value=cached_parts) as vis_mock, \
+             patch.object(AnimeVision, "model", mock_chat_model), \
+             patch.object(AnimeVision, "send_to_mateengine"):
+            resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(resp.status_code, 200)
+            vis_mock.assert_called_once_with(force_fresh=False, include_roi=True)
+            sent_chat_parts = mock_chat_model.generate_content.call_args[0][0]
+            self.assertIn({"mime_type": "image/jpeg", "data": b"scrbytes"}, sent_chat_parts)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  AlphaVision Awareness Engine — Mock Test Suite")
@@ -1240,6 +1419,7 @@ if __name__ == "__main__":
         TestLowLightAndHighResVision,
         TestAntiSleepNagAndPrecedence,
         TestConfigSyncAndSpontaneousToggle,
+        TestSharpVisionDeltaAndLatency,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

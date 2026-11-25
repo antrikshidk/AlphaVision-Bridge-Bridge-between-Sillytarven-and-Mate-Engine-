@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import sys
@@ -35,6 +36,7 @@ import random
 import threading
 import subprocess
 import requests
+from requests.adapters import HTTPAdapter
 import pyautogui
 import numpy as np
 from flask import Flask, request, jsonify, Response
@@ -51,7 +53,7 @@ from engine.perception import (
     SafeScreenGrabber,
     capture_screen_gdi,
     enhance_low_light,
-    compose_screen_and_camera,
+    tag_window,
 )
 from engine.brain import (
     BrainEngine,
@@ -137,11 +139,113 @@ MAX_SLIDING_HISTORY = int(os.getenv("MAX_SLIDING_HISTORY", 6))
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.15
 
+class _FastGeminiResponse:
+    """Lightweight duck-typed response object matching genai.GenerateContentResponse.text."""
+    def __init__(self, text: str):
+        self.text = text
+
+
+class FastGeminiClient:
+    """
+    Persistent keep-alive HTTP client for Gemini v1beta REST generateContent.
+    Reuses pooled TLS sockets, avoids per-turn GenerativeModel instantiation,
+    caps output tokens, and disables hidden thinking overhead (thinkingBudget=0).
+    """
+    def __init__(self, api_key: str, model_name: str, default_max_tokens: int = 75, timeout: float = 12.0):
+        self.api_key = api_key
+        self.model_name = model_name.replace("models/", "")
+        self.default_max_tokens = default_max_tokens
+        self.timeout = timeout
+        self.endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        self._supports_thinking_config = True
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
+    @staticmethod
+    def _to_rest_parts(contents: Any) -> List[Dict[str, Any]]:
+        items = contents if isinstance(contents, (list, tuple)) else [contents]
+        parts: List[Dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, str):
+                if item:
+                    parts.append({"text": item})
+            elif isinstance(item, dict) and "data" in item:
+                raw = item["data"]
+                if isinstance(raw, (bytes, bytearray)):
+                    b64 = base64.b64encode(bytes(raw)).decode("ascii")
+                elif isinstance(raw, str):
+                    b64 = raw
+                else:
+                    continue
+                parts.append({
+                    "inlineData": {
+                        "mimeType": item.get("mime_type", "image/jpeg"),
+                        "data": b64,
+                    }
+                })
+            elif hasattr(item, "save"):
+                buf = io.BytesIO()
+                img_to_save = item.convert("RGB") if getattr(item, "mode", "RGB") != "RGB" else item
+                img_to_save.save(buf, format="JPEG", quality=85)
+                parts.append({
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": base64.b64encode(buf.getvalue()).decode("ascii"),
+                    }
+                })
+        return parts
+
+    def generate_content(
+        self,
+        contents: Any,
+        generation_config: Optional[Dict[str, Any]] = None,
+        system_instruction: Optional[str] = None,
+        disable_thinking: bool = True,
+    ) -> _FastGeminiResponse:
+        cfg = generation_config or {}
+        max_tokens = int(cfg.get("max_output_tokens", self.default_max_tokens))
+        temperature = float(cfg.get("temperature", 0.7))
+
+        gen_cfg: Dict[str, Any] = {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        }
+        if disable_thinking and self._supports_thinking_config:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+
+        payload: Dict[str, Any] = {
+            "contents": [{"role": "user", "parts": self._to_rest_parts(contents)}],
+            "generationConfig": gen_cfg,
+        }
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+
+        resp = self._session.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
+        if resp.status_code == 400 and "thinking" in resp.text.lower() and "thinkingConfig" in gen_cfg:
+            self._supports_thinking_config = False
+            gen_cfg.pop("thinkingConfig", None)
+            resp = self._session.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
+
+        resp.raise_for_status()
+        body = resp.json()
+        text = ""
+        candidates = body.get("candidates") or []
+        if candidates:
+            res_parts = candidates[0].get("content", {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in res_parts if isinstance(p, dict)).strip()
+        return _FastGeminiResponse(text)
+
+
 genai.configure(api_key=GEMINI_API_KEY, transport=os.getenv("GEMINI_TRANSPORT", "rest"))
-model = genai.GenerativeModel(
-    MODEL_NAME,
-    generation_config={"temperature": 0.7, "max_output_tokens": 90}
-)
+model = FastGeminiClient(GEMINI_API_KEY, MODEL_NAME, default_max_tokens=75)
+brain_fast_model = FastGeminiClient(GEMINI_API_KEY, MODEL_NAME, default_max_tokens=45)
 
 app = Flask(__name__)
 CORS(app)
@@ -151,6 +255,8 @@ latest_cam_frame = None
 frame_lock = threading.Lock()
 
 cached_visual_blobs = []
+cached_visual_dict: Dict[str, Optional[bytes]] = {"screen_blob": None, "cam_blob": None, "focus_crop_blob": None}
+cached_visual_ts: float = 0.0
 visual_cache_lock = threading.Lock()
 
 # Live Sensor State
@@ -271,11 +377,11 @@ def send_to_mateengine(text, character_name="Alpha", emotion="joy", trigger_lips
 # =========================================================
 def live_sensor_and_cache_worker():
     """
-    Throttled screen perception (500ms-800ms) with CAPTUREBLT=0 to completely eliminate
-    mouse pointer flickering and DWM contention.
-    Updates the debounced input box state and raw JPEG visual cache.
+    Throttled screen perception (CAPTUREBLT=0, zero pointer flicker).
+    Updates the debounced input box state and keeps separate high-resolution
+    screen + webcam (+ optional ROI crop) JPEG frames warm in RAM.
     """
-    global chat_box_is_open, cached_visual_blobs
+    global chat_box_is_open, cached_visual_blobs, cached_visual_dict, cached_visual_ts
     last_cache_time = 0
 
     debouncer = ChatBoxDebouncer(
@@ -328,24 +434,32 @@ def live_sensor_and_cache_worker():
                         print("\n[SENSOR] >>> Chat Box CLOSED on screen! <<<")
                         chat_open_event.clear()
 
-                # Update raw visual cache every 1.0s (unified 1024px composite screen + live webcam PiP)
+                # Update separate high-definition visual cache every 0.8s (parallel in-memory BytesIO)
                 now = time.time()
-                if now - last_cache_time >= 1.0:
+                if now - last_cache_time >= 0.8:
                     cam_frame = None
+                    active_win = ""
                     if _awareness_perception is not None:
                         cam_frame = _awareness_perception.get_latest_frame()
+                        active_win = _awareness_perception._get_active_window()
+                        blob_dict = _awareness_perception.capture_separate_blobs(
+                            screen_bgr=screen_bgr,
+                            cam_bgr=cam_frame,
+                            screen_max_width=1600,
+                            screen_quality=85,
+                            cam_width=640,
+                            cam_quality=85,
+                            include_roi="auto",
+                            activity_tag=tag_window(active_win),
+                        )
+                    else:
+                        blob_dict = {"screen_blob": None, "cam_blob": None, "focus_crop_blob": None}
 
-                    composite_jpeg = compose_screen_and_camera(
-                        screen_bgr=screen_bgr,
-                        cam_bgr=cam_frame,
-                        target_screen_width=1024,
-                        pip_width=280,
-                        quality=75,
-                        enhance_lighting=True,
-                    )
-                    blobs = [{"mime_type": "image/jpeg", "data": composite_jpeg}] if composite_jpeg else []
+                    parts = _format_separate_visual_parts(blob_dict)
                     with visual_cache_lock:
-                        cached_visual_blobs = blobs
+                        cached_visual_dict = blob_dict
+                        cached_visual_blobs = parts
+                        cached_visual_ts = now
                     last_cache_time = now
 
         except Exception as e:
@@ -354,37 +468,65 @@ def live_sensor_and_cache_worker():
         time.sleep(0.15)
 
 
-def get_cached_visuals(force_fresh: bool = False):
-    """
-    Returns cached JPEG frame blobs (unified composite screen + webcam).
-    If force_fresh=True, immediately queries the latest hardware camera frame
-    and desktop screen snapshot with low-light enhancement (CLAHE + gamma boost)
-    and renders a fresh 1024px composite frame with PiP webcam, guaranteeing
-    crisp legibility of text, formulas, and code.
-    """
-    if force_fresh:
-        try:
-            cam_frame = None
-            if _awareness_perception is not None:
-                cam_frame = _awareness_perception.get_latest_frame()
+def _format_separate_visual_parts(blob_dict: Dict[str, Optional[bytes]]) -> List[Any]:
+    """Formats separate sharp screen, webcam, and optional ROI crop into labeled Gemini parts."""
+    parts: List[Any] = []
+    scr = blob_dict.get("screen_blob")
+    cam = blob_dict.get("cam_blob")
+    roi = blob_dict.get("focus_crop_blob")
+    if scr:
+        parts.extend(["[LIVE SCREEN (1600x900)]", {"mime_type": "image/jpeg", "data": scr}])
+    if cam:
+        parts.extend(["[LIVE WEBCAM (640x480)]", {"mime_type": "image/jpeg", "data": cam}])
+    if roi:
+        parts.extend(["[ACTIVE WINDOW / CURSOR HIGH-RES CROP]", {"mime_type": "image/jpeg", "data": roi}])
+    return parts
 
-            scr_bgr = capture_screen_gdi()
-            composite_jpeg = compose_screen_and_camera(
-                screen_bgr=scr_bgr,
-                cam_bgr=cam_frame,
-                target_screen_width=1024,
-                pip_width=280,
-                quality=75,
-                enhance_lighting=True,
+
+def get_live_visual_dict(force_fresh: bool = False, include_roi: Any = "auto") -> Dict[str, Optional[bytes]]:
+    """Returns separate in-memory JPEG byte blobs for screen, webcam, and optional ROI crop."""
+    if force_fresh and _awareness_perception is not None:
+        try:
+            active_win = _awareness_perception._get_active_window()
+            blob_dict = _awareness_perception.capture_separate_blobs(
+                screen_max_width=1600,
+                screen_quality=85,
+                cam_width=640,
+                cam_quality=85,
+                include_roi=include_roi,
+                activity_tag=tag_window(active_win),
             )
-            if composite_jpeg:
-                return [{"mime_type": "image/jpeg", "data": composite_jpeg}]
+            if any(blob_dict.values()):
+                with visual_cache_lock:
+                    cached_visual_dict.update(blob_dict)
+                    cached_visual_blobs[:] = _format_separate_visual_parts(blob_dict)
+                return blob_dict
         except Exception as fresh_err:
             app_logger.debug(f"[FRESH VISUAL ERR] {fresh_err}")
+    with visual_cache_lock:
+        return dict(cached_visual_dict)
+
+
+def get_cached_visuals(force_fresh: bool = False, include_roi: Any = "auto"):
+    """
+    Returns labeled separate JPEG image parts ([LIVE SCREEN], [LIVE WEBCAM],
+    and optional [ACTIVE WINDOW / CURSOR HIGH-RES CROP]) encoded in-memory via BytesIO.
+    If force_fresh=False and cache is empty (e.g. cold turn), falls back to a fresh capture.
+    """
+    if force_fresh:
+        fresh_dict = get_live_visual_dict(force_fresh=True, include_roi=include_roi)
+        fresh_parts = _format_separate_visual_parts(fresh_dict)
+        if fresh_parts:
+            return fresh_parts
 
     try:
         with visual_cache_lock:
-            return list(cached_visual_blobs)
+            cached = list(cached_visual_blobs)
+        if cached:
+            return cached
+        # Cold-start safety: if cache hasn't populated yet, capture live right now
+        fresh_dict = get_live_visual_dict(force_fresh=True, include_roi=include_roi)
+        return _format_separate_visual_parts(fresh_dict)
     except Exception:
         return []
 
@@ -452,43 +594,9 @@ def process_actions_and_clean_text(raw_text):
 
 
 # =========================================================
-# 3. SPONTANEOUS THOUGHT PRODUCER & ENDPOINT
+# 3. SPONTANEOUS THOUGHT ENDPOINTS & CONFIG SYNC
+#    (Single unified spontaneous producer runs inside BrainEngine)
 # =========================================================
-def proactive_observer_loop():
-    global last_interaction_time
-    print("[SYSTEM] Autonomous thought engine online...")
-
-    while True:
-        sleep_duration = random.randint(RANDOM_MSG_MIN_INTERVAL, RANDOM_MSG_MAX_INTERVAL)
-        time.sleep(sleep_duration)
-
-        if not _spontaneous_pokes_enabled:
-            continue
-        if time.time() - last_interaction_time < RANDOM_MSG_MIN_INTERVAL:
-            continue
-
-        visuals = get_cached_visuals()
-        if not visuals:
-            continue
-
-        proactive_prompt = (
-            "You are Alpha, a possessive, sharp-witted desktop anime companion glancing over Antriksh's shoulder. "
-            "A composite image of his primary desktop screen with his live webcam in the bottom-right corner is attached. "
-            "Look at what is directly on his screen (code, PDF, homework, browser, video) and his webcam. "
-            "Make ONE short, spontaneous, witty comment (max 14 words) specifically about what he is doing, viewing, or studying."
-        )
-
-        try:
-            response = model.generate_content(visuals + [proactive_prompt])
-            from engine.brain import clean_thought
-            remark = clean_thought(process_actions_and_clean_text(response.text.strip()))
-            if remark:
-                app_logger.info(f"[SPONTANEOUS QUEUED] '{remark}'")
-                spontaneous_thought_queue.put(remark)
-                set_last_ambient_poke(remark, "proactive_observer")
-                last_interaction_time = time.time()
-        except Exception as e:
-            app_logger.warning(f"[SPONTANEOUS ERROR] {e}")
 
 
 _last_popped_pop: Optional[tuple[str, float]] = None
@@ -704,13 +812,13 @@ def universal_chat_bridge(path=""):
                 for m in conversation_memory[-MAX_SLIDING_HISTORY:]
             )
 
-        # 2. Ephemeral System Instruction & Isolated Direct Response Prompt
+        # 2. Ephemeral System Instruction & Always-On Multimodal Chat Prompt
         system_instruction_lines = [
-            "You are Alpha, a cheerful, possessive desktop anime companion with vision and desktop control sitting on Antriksh's desktop.",
-            "You are having a direct, real-time conversation with Antriksh in the companion chat box.",
+            "You are Alpha, a sharp-eyed, playful desktop anime companion with live vision and desktop control sitting on Antriksh's screen.",
+            "You have Antriksh's live SCREEN image, live WEBCAM image, and optional high-res zoom crop attached to this conversation turn.",
             "CRITICAL INSTRUCTIONS FOR CHAT INPUT ROUTING:",
-            "1. When Antriksh sends a message, respond directly, conversationally, and contextually to his typed message.",
-            "2. NEVER hijack or ignore his input with unprompted ambient observations about the screen or background apps unless his message specifically asks about them.",
+            "1. Respond directly, conversationally, and naturally to Antriksh's typed message.",
+            "2. Ground visual references strictly in what is visible in the attached screen/webcam pixels—use them naturally whenever helpful, without hijacking his topic.",
             "3. Reply in 1-2 short, punchy sentences.",
             "DESKTOP ACTIONS (only use when explicitly asked to control PC/media):",
             "- [[ACTION: media, playpause]] / [[ACTION: media, next]] / [[ACTION: media, prev]]",
@@ -729,19 +837,17 @@ def universal_chat_bridge(path=""):
             f"Alpha (reply directly to Antriksh's message '{user_msg}'):"
         )
 
-        # Vision Gating: Only attach heavy multi-modal visual frames if user explicitly requested vision
-        needs_vision = is_vision_requested(user_msg)
-        visuals = get_cached_visuals(force_fresh=True) if needs_vision else []
+        # Always attach separate live frames on every chat turn (cached normally, force-fresh when explicitly looking)
+        visuals = get_cached_visuals(force_fresh=is_vision_requested(user_msg), include_roi=True)
         gemini_payload = visuals + [user_content_str] if visuals else [user_content_str]
 
         answer = None
         try:
-            chat_model = genai.GenerativeModel(
-                MODEL_NAME,
+            response = model.generate_content(
+                gemini_payload,
                 system_instruction=system_instruction_str,
-                generation_config={"temperature": 0.7, "max_output_tokens": 60}
+                generation_config={"temperature": 0.7, "max_output_tokens": 75},
             )
-            response = chat_model.generate_content(gemini_payload)
             if response and hasattr(response, "text") and response.text:
                 answer = process_actions_and_clean_text(response.text.strip())
         except Exception as e:
@@ -871,16 +977,12 @@ def _launch_subconscious_engine():
         shared_thought_queue=spontaneous_thought_queue,
     )
 
-    # Brain model — same Gemini model, but low-token setting for rapid generation (<800ms)
-    brain_model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config={"temperature": 0.7, "max_output_tokens": 50},
-    )
-
     _awareness_brain = BrainEngine(
         snapshot_queue=perc_q,
         remark_callback=_awareness_dispatcher.push,
-        gemini_model=brain_model,
+        gemini_model=brain_fast_model,
+        visual_fetcher=lambda include_roi=True: get_live_visual_dict(force_fresh=True, include_roi=include_roi),
+        require_vision=True,
     )
 
     # Dedicated PerceptionEngine with built-in non-blocking CameraWorker (2.0s init timeout)
@@ -987,9 +1089,8 @@ if __name__ == '__main__':
     # Launch Subconscious Engine (Perception with isolated CameraWorker, Brain, Dispatcher)
     _launch_subconscious_engine()
 
-    # Core background workers
+    # Core background workers (BrainEngine drives all unified delta/ambient remarks)
     threading.Thread(target=live_sensor_and_cache_worker, daemon=True, name="SensorCacheWorker").start()
-    threading.Thread(target=proactive_observer_loop, daemon=True, name="ProactiveObserver").start()
     threading.Thread(target=_bridge_health_watchdog, daemon=True, name="BridgeWatchdog").start()
 
     print(f"[SYSTEM] Full stack active on port {FLASK_PORT}.")

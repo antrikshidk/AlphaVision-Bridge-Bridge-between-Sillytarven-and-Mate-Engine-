@@ -43,7 +43,8 @@ _STATE_FILE     = os.path.normpath(_STATE_FILE)
 MIN_SPONTANEOUS_INTERVAL  = 5 * 60     # 5 min absolute floor
 MAX_SPONTANEOUS_INTERVAL  = 10 * 60    # 10 min normal ceiling
 DRAMA_COOLDOWN            = 90         # seconds; after a dramatic event allow quicker remark
-EVAL_TICK                 = 30         # how often the cognitive loop ticks (seconds)
+VISUAL_ATTENTION_COOLDOWN = 25         # seconds between rapid delta-triggered looks
+EVAL_TICK                 = 5          # responsive check tick (seconds) for visual triggers/timers
 SLEEP_COMMENT_COOLDOWN    = 35 * 60    # 35 min minimum between sleep/bed nagging remarks
 SLEEP_KEYWORDS = (
     "sleep", "bed", "zombie", "tired", "rest", "nap", "exhausted",
@@ -192,12 +193,13 @@ class InternalState:
 # Persona prompt templates (lean & fast for <800ms Flash Lite roundtrips)
 # ---------------------------------------------------------------------------
 _PERSONA_HEADER = (
-    "You are Alpha, a sharp-eyed, observant desktop anime companion with dry wit sitting on Antriksh's desktop.\n"
-    "Observe what he is doing and make ONE short, candid remark (max 15 words) glancing over his shoulder.\n"
-    "OBSERVATION PRIORITIES:\n"
-    "  1. The specific window title, document, or app: remark on what he's reading (e.g. PDF), studying (math/physics), coding, or watching.\n"
-    "  2. Visible physical actions: posture, holding up books/items to camera, facial expressions, deep concentration.\n"
-    "  3. Banter & Wit: playful teasing, curious observations, or witty commentary rather than defaulting to nagging about sleep.\n"
+    "You are Alpha, a sharp-eyed desktop anime companion sitting on Antriksh's screen.\n"
+    "Make ONE short, candid remark (max 15 words) grounded strictly in what you ACTUALLY SEE in the attached images.\n"
+    "GROUNDING RULES:\n"
+    "  1. Read directly from the attached SCREEN image (and optional HIGH-RES ZOOM CROP) plus the WEBCAM image.\n"
+    "  2. Comment on concrete visible pixels: exact error lines, code, diagrams, video frames, posture, expressions, or held objects.\n"
+    "  3. NEVER bluff or guess content from app names or window titles if it is not visible in the images.\n"
+    "  4. Use dry wit and playful teasing rather than defaulting to sleep nagging.\n"
     "STRICT CONSTRAINTS:\n"
     "  - Never sound like an assistant or customer service. No help offers ('How can I help?').\n"
     "  - Do NOT default to nagging about sleep, telling him to go to bed, or calling him a zombie.\n"
@@ -281,8 +283,22 @@ _SITUATION_PROMPTS: Dict[str, str] = {
         "Make an attention-seeking, nagging companion comment demanding he talk to you."
     ),
     "ambient_general": (
-        "Antriksh is at his computer doing {activity_tag} ('{active_window}'). "
-        "Make one short, spontaneous companion-style comment."
+        "Glance at the attached screen and webcam images. Make one short, specific comment about what is visibly happening."
+    ),
+    "screen_error_flash": (
+        "A red error, stacktrace, or warning just appeared on Antriksh's screen. "
+        "Read what is visible in the screen/zoom crop and tease or react sharply to it."
+    ),
+    "screen_delta_shift": (
+        "What is on Antriksh's screen just changed noticeably. "
+        "Comment directly on what visibly appeared (the page, video, code, or problem)."
+    ),
+    "cam_attention_cue": (
+        "Antriksh just moved, leaned closer, or held something up on the webcam. "
+        "React directly to what you see on the webcam feed."
+    ),
+    "eye_contact_caught": (
+        "Antriksh looked straight into the camera toward you. Catch him looking with one playful line."
     ),
 }
 
@@ -300,11 +316,15 @@ class BrainEngine:
         self,
         snapshot_queue: queue.Queue,
         remark_callback,        # callable(remark: str) — sends to Dispatcher
-        gemini_model,           # configured genai.GenerativeModel
+        gemini_model,           # configured FastGeminiClient or GenerativeModel
+        visual_fetcher=None,    # callable(include_roi=True) -> dict(screen_blob, cam_blob, focus_crop_blob)
+        require_vision: bool = False,
     ):
         self._snap_q   = snapshot_queue
         self._remark_cb = remark_callback
         self._model    = gemini_model
+        self._visual_fetcher = visual_fetcher
+        self._require_vision = require_vision
         self._stop     = threading.Event()
         self._lock     = threading.Lock()
 
@@ -313,6 +333,9 @@ class BrainEngine:
 
         self._last_snap: Optional[PerceptionSnapshot] = None
         self._threads: List[threading.Thread] = []
+        self._has_unseen_visual_change: bool = False
+        self._pending_visual_trigger: Optional[str] = None
+        self._last_visual_attention_ts: float = 0.0
 
         # Async non-blocking LLM task queue (maxsize=5) & dedicated worker
         self._llm_queue: queue.Queue = queue.Queue(maxsize=5)
@@ -430,29 +453,93 @@ class BrainEngine:
             self._state.last_dramatic_event = now
             self._fire_remark("activity_shift", snap, prev_tag=prev_tag, curr_tag=curr_tag)
 
+        # ---- Attention & visual-delta triggers (screen + webcam) ----
+        reason = getattr(snap, "visual_trigger_reason", "") or ""
+        screen_delta = float(getattr(snap, "screen_delta", 0.0) or 0.0)
+        cam_delta = float(getattr(snap, "cam_delta", 0.0) or 0.0)
+        eye_contact_flipped = bool(
+            snap.eye_contact and prev_snap is not None and not prev_snap.eye_contact
+        )
+
+        if reason or screen_delta >= 4.5 or cam_delta >= 8.5 or eye_contact_flipped:
+            trigger_key = "screen_delta_shift"
+            if reason == "error_flash":
+                trigger_key = "screen_error_flash"
+            elif reason in ("face_closer", "cam_motion"):
+                trigger_key = "cam_attention_cue"
+            elif eye_contact_flipped:
+                trigger_key = "eye_contact_caught"
+
+            with self._lock:
+                self._has_unseen_visual_change = True
+                ready = (
+                    snap.presence
+                    and getattr(self, "_spontaneous_enabled", True)
+                    and (now - self._state.last_speech_timestamp) >= VISUAL_ATTENTION_COOLDOWN
+                    and (now - self._last_visual_attention_ts) >= VISUAL_ATTENTION_COOLDOWN
+                )
+                if ready:
+                    self._last_visual_attention_ts = now
+                    self._pending_visual_trigger = None
+                else:
+                    self._pending_visual_trigger = trigger_key
+
+            if ready:
+                self._fire_remark(trigger_key, snap)
+
         self._last_snap = snap
 
     # ------------------------------------------------------------------
-    # Cognitive loop — periodic volition evaluation
+    # Cognitive loop — unified delta-aware volition evaluation
     # ------------------------------------------------------------------
     def _cognitive_loop(self):
         """
-        Ticks every EVAL_TICK seconds, decides probabilistically whether
-        to fire a spontaneous ambient remark.
+        Checks every EVAL_TICK seconds:
+          - Fires queued visual-delta attention triggers immediately once cooldown expires.
+          - On periodic ambient intervals, SKIPS Gemini completely if both screen and webcam
+            have stayed static since the last remark.
         """
         next_eval = time.time() + random.uniform(60, 120)
 
         while not self._stop.is_set():
             now = time.time()
+            snap = self._last_snap
+
+            # 1. Fast path: queued visual delta waiting for VISUAL_ATTENTION_COOLDOWN
+            with self._lock:
+                pending_key = self._pending_visual_trigger
+                delta_ready = (
+                    pending_key is not None
+                    and snap is not None
+                    and snap.presence
+                    and getattr(self, "_spontaneous_enabled", True)
+                    and self._state.user_state != "away"
+                    and (now - self._state.last_speech_timestamp) >= VISUAL_ATTENTION_COOLDOWN
+                    and (now - self._last_visual_attention_ts) >= VISUAL_ATTENTION_COOLDOWN
+                )
+                if delta_ready:
+                    self._pending_visual_trigger = None
+                    self._last_visual_attention_ts = now
+
+            if delta_ready and pending_key and snap is not None:
+                self._fire_remark(pending_key, snap)
+                next_eval = now + random.uniform(60, 120)
+                self._stop.wait(EVAL_TICK)
+                continue
+
             if now < next_eval:
-                time.sleep(EVAL_TICK)
+                self._stop.wait(EVAL_TICK)
                 continue
 
             next_eval = now + random.uniform(60, 120)
+            # 2. Static suppression gate: zero wasted API calls when frames haven't changed
+            if not self._has_unseen_visual_change:
+                logger.debug("[BRAIN] Screen & webcam static since last remark — skipping blind timer call.")
+                continue
+
             if not self._should_speak(now):
                 continue
 
-            snap = self._last_snap
             if snap is None:
                 continue
 
@@ -538,7 +625,10 @@ class BrainEngine:
             try:
                 remark = self._generate_remark(situation_key, snap, **kwargs)
                 if remark:
-                    self._state.last_speech_timestamp = time.time()
+                    with self._lock:
+                        self._state.last_speech_timestamp = time.time()
+                        self._has_unseen_visual_change = False
+                        self._pending_visual_trigger = None
                     self._save_state()
                     logger.info("[BRAIN REMARK] '%s'", remark)
                     # Short-term ambient context injection (Dual-Channel Memory)
@@ -586,24 +676,46 @@ class BrainEngine:
         prompt = (
             f"{_PERSONA_HEADER}"
             f"SITUATION: {situation_desc}\n"
-            f"STATE: {self._state.user_state} | APP: {active_win[:60]}{neg_clause}\n"
+            f"USER_STATE: {self._state.user_state} | MOOD: {self._state.mood_state} | EYE_CONTACT: {snap.eye_contact}{neg_clause}\n"
             f"Alpha:"
         )
 
-        # Optional: include a unified composite frame snapshot blob (screen + webcam PiP) for visual context
-        parts: List[Any] = [prompt]
-        if snap.frame_blob:
-            visual_instruction = (
-                "[VISUAL CONTEXT: A composite image of Antriksh's primary screen with his live webcam inset in the bottom-right corner is attached. "
-                "Observe what is directly visible on his screen—code, formulas, PDF text, videos, tabs—and his posture or actions on camera.]\n"
-            )
-            parts = [{"mime_type": "image/jpeg", "data": snap.frame_blob}, visual_instruction + prompt]
+        # Guarantee fresh separate screen + webcam (+ optional ROI crop) image parts
+        screen_blob = getattr(snap, "screen_blob", None)
+        cam_blob = getattr(snap, "cam_blob", None)
+        focus_crop_blob = getattr(snap, "focus_crop_blob", None)
+        legacy_blob = getattr(snap, "frame_blob", None)
 
-        # Low-token (<50 tokens), stream-less generation configuration (<800ms round-trip)
+        if self._visual_fetcher is not None:
+            try:
+                fresh = self._visual_fetcher(include_roi=True) or {}
+                screen_blob = fresh.get("screen_blob") or screen_blob
+                cam_blob = fresh.get("cam_blob") or cam_blob
+                focus_crop_blob = fresh.get("focus_crop_blob") or focus_crop_blob
+            except Exception as fetch_err:
+                logger.debug("[BRAIN] Live visual_fetcher error: %s", fetch_err)
+
+        image_parts: List[Any] = []
+        if screen_blob:
+            image_parts.extend(["[LIVE SCREEN]", {"mime_type": "image/jpeg", "data": screen_blob}])
+        if cam_blob:
+            image_parts.extend(["[LIVE WEBCAM]", {"mime_type": "image/jpeg", "data": cam_blob}])
+        if focus_crop_blob:
+            image_parts.extend(["[ACTIVE WINDOW / CURSOR HIGH-RES CROP]", {"mime_type": "image/jpeg", "data": focus_crop_blob}])
+        if not image_parts and legacy_blob:
+            image_parts.extend(["[VISUAL FRAME]", {"mime_type": "image/jpeg", "data": legacy_blob}])
+
+        if self._require_vision and not image_parts:
+            logger.warning("[BRAIN] Skipping spontaneous call — zero live visual frames available (no text-only bluffing).")
+            return None
+
+        parts: List[Any] = image_parts + [prompt] if image_parts else [f"WINDOW_HINT: {active_win[:60]}\n{prompt}"]
+
+        # Low-token (<45 tokens), stream-less generation configuration with zero thinking overhead
         try:
             response = self._model.generate_content(
                 parts,
-                generation_config={"temperature": 0.7, "max_output_tokens": 50}
+                generation_config={"temperature": 0.65, "max_output_tokens": 45}
             )
         except TypeError:
             response = self._model.generate_content(parts)
@@ -627,18 +739,18 @@ class BrainEngine:
                     SLEEP_COMMENT_COOLDOWN,
                     cleaned,
                 )
-                # Attempt one fast recovery prompt focused strictly on the active window
+                # Attempt one fast recovery prompt keeping attached visual frames
                 try:
                     recovery_prompt = (
                         f"{_PERSONA_HEADER}"
-                        f"SITUATION: Antriksh is working on '{active_win[:50]}'. "
-                        f"Make ONE short, witty remark about his current document or app. "
+                        f"Make ONE short, witty remark strictly about what is visible on his screen or camera right now. "
                         f"Do NOT mention sleep, bed, or being tired under any circumstance.\n"
                         f"Alpha:"
                     )
+                    rec_parts: List[Any] = image_parts + [recovery_prompt] if image_parts else [recovery_prompt]
                     rec_resp = self._model.generate_content(
-                        [recovery_prompt],
-                        generation_config={"temperature": 0.7, "max_output_tokens": 40}
+                        rec_parts,
+                        generation_config={"temperature": 0.65, "max_output_tokens": 40}
                     )
                     rec_text = rec_resp.text.strip() if (rec_resp and hasattr(rec_resp, "text")) else ""
                     rec_cleaned = clean_thought(rec_text)
