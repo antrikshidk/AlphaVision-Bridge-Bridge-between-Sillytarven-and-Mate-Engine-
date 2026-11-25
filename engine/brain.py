@@ -25,6 +25,7 @@ import time
 import threading
 import queue
 import datetime
+from collections import deque
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any
 
@@ -43,7 +44,7 @@ _STATE_FILE     = os.path.normpath(_STATE_FILE)
 MIN_SPONTANEOUS_INTERVAL  = 5 * 60     # 5 min absolute floor
 MAX_SPONTANEOUS_INTERVAL  = 10 * 60    # 10 min normal ceiling
 DRAMA_COOLDOWN            = 90         # seconds; after a dramatic event allow quicker remark
-VISUAL_ATTENTION_COOLDOWN = 25         # seconds between rapid delta-triggered looks
+VISUAL_ATTENTION_COOLDOWN = 90         # seconds between delta-triggered looks (prevents spam)
 EVAL_TICK                 = 5          # responsive check tick (seconds) for visual triggers/timers
 SLEEP_COMMENT_COOLDOWN    = 35 * 60    # 35 min minimum between sleep/bed nagging remarks
 SLEEP_KEYWORDS = (
@@ -336,6 +337,7 @@ class BrainEngine:
         self._has_unseen_visual_change: bool = False
         self._pending_visual_trigger: Optional[str] = None
         self._last_visual_attention_ts: float = 0.0
+        self._recent_remarks: deque[str] = deque(maxlen=5)
 
         # Async non-blocking LLM task queue (maxsize=5) & dedicated worker
         self._llm_queue: queue.Queue = queue.Queue(maxsize=5)
@@ -629,6 +631,7 @@ class BrainEngine:
                         self._state.last_speech_timestamp = time.time()
                         self._has_unseen_visual_change = False
                         self._pending_visual_trigger = None
+                        self._recent_remarks.append(remark)
                     self._save_state()
                     logger.info("[BRAIN REMARK] '%s'", remark)
                     # Short-term ambient context injection (Dual-Channel Memory)
@@ -673,10 +676,21 @@ class BrainEngine:
                 "Talk strictly about the document, active application, visible actions, or his work."
             )
 
+        with self._lock:
+            recent_list = list(self._recent_remarks)
+        recent_clause = ""
+        if recent_list:
+            bullets = "\n".join(f'  - "{r}"' for r in recent_list)
+            recent_clause = (
+                "\nRECENT_REMARKS_DO_NOT_REPEAT (do NOT reuse these phrasing patterns, jokes, or tropes):\n"
+                f"{bullets}"
+            )
+
         prompt = (
             f"{_PERSONA_HEADER}"
             f"SITUATION: {situation_desc}\n"
-            f"USER_STATE: {self._state.user_state} | MOOD: {self._state.mood_state} | EYE_CONTACT: {snap.eye_contact}{neg_clause}\n"
+            f"USER_STATE: {self._state.user_state} | MOOD: {self._state.mood_state} | EYE_CONTACT: {snap.eye_contact}"
+            f"{neg_clause}{recent_clause}\n"
             f"Alpha:"
         )
 

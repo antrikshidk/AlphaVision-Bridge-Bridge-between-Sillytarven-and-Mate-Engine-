@@ -1401,9 +1401,41 @@ class TestSharpVisionDeltaAndLatency(unittest.TestCase):
              patch.object(AnimeVision, "send_to_mateengine"):
             resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
             self.assertEqual(resp.status_code, 200)
-            vis_mock.assert_called_once_with(force_fresh=False, include_roi=True)
+            vis_mock.assert_called_once_with(force_fresh=True, include_roi=True)
             sent_chat_parts = mock_chat_model.generate_content.call_args[0][0]
             self.assertIn({"mime_type": "image/jpeg", "data": b"scrbytes"}, sent_chat_parts)
+
+    def test_brain_cooldown_90_last_5_remarks_and_plugin_fallback(self):
+        """VISUAL_ATTENTION_COOLDOWN must be 90s, last 5 remarks must inject into _generate_remark, and plugin must fallback to :5001."""
+        from engine.brain import BrainEngine, VISUAL_ATTENTION_COOLDOWN
+        from engine.perception import PerceptionSnapshot
+
+        self.assertEqual(VISUAL_ATTENTION_COOLDOWN, 90)
+
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = MagicMock(text="Try integrating sin x + cos x directly.")
+        brain = BrainEngine(
+            queue.Queue(),
+            MagicMock(),
+            mock_model,
+            visual_fetcher=lambda include_roi=True: {"screen_blob": b"scr", "cam_blob": b"cam"},
+            require_vision=True,
+        )
+        for i in range(6):
+            brain._recent_remarks.append(f"Old remark number {i}")
+
+        brain._generate_remark("ambient_reading", PerceptionSnapshot(active_window="Math.pdf"))
+        sent_parts = mock_model.generate_content.call_args[0][0]
+        prompt_str = sent_parts[-1]
+        self.assertNotIn("Old remark number 0", prompt_str)
+        for i in range(1, 6):
+            self.assertIn(f"Old remark number {i}", prompt_str)
+
+        plugin_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extensions", "mateengine-chat-plugin", "index.js")
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            plugin_js = f.read()
+        self.assertIn("/v1/chat/completions", plugin_js)
+        self.assertIn("forwardDirectToAlphaVision", plugin_js)
 
     def test_chat_bridge_tokens_450_sse_logging_and_dispatcher_history(self):
         """Chat bridge must log POST path/keys, use 450 tokens, parse OpenAI messages cleanly, inject Dispatcher history, and support SSE."""

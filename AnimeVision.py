@@ -906,8 +906,8 @@ def universal_chat_bridge(path=""):
             f"Alpha (reply directly to Antriksh's message '{user_msg}'):"
         )
 
-        # Always attach separate live frames on every chat turn (cached normally, force-fresh when explicitly looking)
-        visuals = get_cached_visuals(force_fresh=is_vision_requested(user_msg), include_roi=True)
+        # Always attach fresh separate screen + webcam (+ high-res ROI crop) frames on every chat turn
+        visuals = get_cached_visuals(force_fresh=True, include_roi=True)
         gemini_payload = visuals + [user_content_str] if visuals else [user_content_str]
 
         answer = None
