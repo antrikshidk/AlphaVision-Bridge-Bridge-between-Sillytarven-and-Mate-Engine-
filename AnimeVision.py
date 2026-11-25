@@ -612,11 +612,94 @@ def process_actions_and_clean_text(raw_text):
 _last_popped_pop: Optional[tuple[str, float]] = None
 _pop_lock = threading.Lock()
 
-# Spontaneous pokes runtime config (synced from SillyTavern UI :5001)
-_spontaneous_pokes_enabled: bool = True
+_BRAIN_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_state.json")
+
+
+def _load_persisted_spontaneous_enabled() -> bool:
+    try:
+        if os.path.exists(_BRAIN_STATE_FILE):
+            with open(_BRAIN_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "spontaneous_enabled" in data:
+                    return bool(data["spontaneous_enabled"])
+    except Exception:
+        pass
+    return True
+
+
+def _save_persisted_spontaneous_enabled(enabled: bool):
+    try:
+        data: Dict[str, Any] = {}
+        if os.path.exists(_BRAIN_STATE_FILE):
+            with open(_BRAIN_STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        data["spontaneous_enabled"] = bool(enabled)
+        with open(_BRAIN_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        app_logger.debug(f"[CONFIG PERSIST WARN] Could not save spontaneous_enabled: {exc}")
+
+
+# Spontaneous pokes runtime config (synced from SillyTavern :8000 and MateEngine UI :8787 -> :5001)
+_spontaneous_pokes_enabled: bool = _load_persisted_spontaneous_enabled()
 _in_chat_poke_enabled: bool = False
 _desktop_bubbles_enabled: bool = False
 _config_lock = threading.Lock()
+
+
+def _apply_spontaneous_toggle(enabled: bool) -> bool:
+    global _spontaneous_pokes_enabled
+    val = bool(enabled)
+    with _config_lock:
+        _spontaneous_pokes_enabled = val
+    if _awareness_brain is not None and hasattr(_awareness_brain, "set_spontaneous_enabled"):
+        _awareness_brain.set_spontaneous_enabled(val)
+    else:
+        _save_persisted_spontaneous_enabled(val)
+    if _awareness_dispatcher is not None and hasattr(_awareness_dispatcher, "set_spontaneous_enabled"):
+        _awareness_dispatcher.set_spontaneous_enabled(val)
+    return val
+
+
+@app.route('/api/spontaneous', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/toggle_spontaneous', methods=['GET', 'POST', 'OPTIONS'])
+def spontaneous_toggle_endpoint():
+    """
+    Dedicated GET/POST endpoint for MateEngine UI's GENERAL -> SPONTANEOUS REMARKS toggle.
+    GET returns {"enabled": bool, "spontaneous_pokes_enabled": bool} for initial checkbox sync.
+    POST accepts {"enabled": bool} (or flips current state if omitted), updates runtime engines, and persists.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+
+    if request.method == 'GET':
+        with _config_lock:
+            curr = _spontaneous_pokes_enabled
+        return jsonify({
+            "enabled": curr,
+            "spontaneous_pokes_enabled": curr,
+        }), 200
+
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        new_val = bool(data["enabled"])
+    elif "spontaneous_pokes_enabled" in data:
+        new_val = bool(data["spontaneous_pokes_enabled"])
+    elif "spontaneousPokesEnabled" in data:
+        new_val = bool(data["spontaneousPokesEnabled"])
+    else:
+        with _config_lock:
+            new_val = not _spontaneous_pokes_enabled
+
+    applied = _apply_spontaneous_toggle(new_val)
+    app_logger.info(f"[SPONTANEOUS TOGGLE] Spontaneous remarks set to enabled={applied} (persisted)")
+    return jsonify({
+        "success": True,
+        "enabled": applied,
+        "spontaneous_pokes_enabled": applied,
+    }), 200
 
 
 @app.route('/api/config', methods=['GET', 'POST', 'OPTIONS'])
@@ -640,11 +723,14 @@ def runtime_config_endpoint():
             }), 200
 
     data = request.get_json(force=True, silent=True) or {}
+    toggled_spont = None
     with _config_lock:
         if "spontaneous_pokes_enabled" in data:
-            _spontaneous_pokes_enabled = bool(data["spontaneous_pokes_enabled"])
+            toggled_spont = bool(data["spontaneous_pokes_enabled"])
         elif "spontaneousPokesEnabled" in data:
-            _spontaneous_pokes_enabled = bool(data["spontaneousPokesEnabled"])
+            toggled_spont = bool(data["spontaneousPokesEnabled"])
+        elif "enabled" in data:
+            toggled_spont = bool(data["enabled"])
 
         if "in_chat_poke_enabled" in data:
             _in_chat_poke_enabled = bool(data["in_chat_poke_enabled"])
@@ -656,10 +742,8 @@ def runtime_config_endpoint():
         elif "desktopBubblesEnabled" in data:
             _desktop_bubbles_enabled = bool(data["desktopBubblesEnabled"])
 
-    if _awareness_brain is not None and hasattr(_awareness_brain, "set_spontaneous_enabled"):
-        _awareness_brain.set_spontaneous_enabled(_spontaneous_pokes_enabled)
-    if _awareness_dispatcher is not None and hasattr(_awareness_dispatcher, "set_spontaneous_enabled"):
-        _awareness_dispatcher.set_spontaneous_enabled(_spontaneous_pokes_enabled)
+    if toggled_spont is not None:
+        _apply_spontaneous_toggle(toggled_spont)
 
     app_logger.info(
         f"[CONFIG SYNC] Runtime config updated: spontaneous_pokes_enabled={_spontaneous_pokes_enabled}, "

@@ -1213,6 +1213,88 @@ class TestConfigSyncAndSpontaneousToggle(unittest.TestCase):
         self.assertEqual(resp2.status_code, 200)
         self.assertTrue(AnimeVision._spontaneous_pokes_enabled)
 
+    def test_spontaneous_endpoints_and_persistence(self):
+        """GET/POST /api/spontaneous and /toggle_spontaneous sync state and persist cleanly."""
+        import os
+        import AnimeVision
+        from engine.brain import BrainEngine, InternalState
+
+        state_path = os.path.join(os.path.dirname(AnimeVision.__file__), "brain_state.json")
+        orig_state_bytes = None
+        if os.path.exists(state_path):
+            with open(state_path, "rb") as f:
+                orig_state_bytes = f.read()
+
+        orig_enabled = AnimeVision._spontaneous_pokes_enabled
+        try:
+            client = AnimeVision.app.test_client()
+
+            # Initial GET returns current flag cleanly
+            resp_get = client.get("/api/spontaneous")
+            self.assertEqual(resp_get.status_code, 200)
+            g_data = resp_get.get_json()
+            self.assertIn("enabled", g_data)
+            self.assertIn("spontaneous_pokes_enabled", g_data)
+            self.assertEqual(g_data["enabled"], orig_enabled)
+
+            # POST /api/spontaneous -> False
+            resp_off = client.post("/api/spontaneous", json={"enabled": False})
+            self.assertEqual(resp_off.status_code, 200)
+            off_data = resp_off.get_json()
+            self.assertTrue(off_data.get("success"))
+            self.assertFalse(off_data.get("enabled"))
+            self.assertFalse(AnimeVision._spontaneous_pokes_enabled)
+            self.assertFalse(AnimeVision._load_persisted_spontaneous_enabled())
+
+            # Fresh BrainEngine loads persisted False from brain_state.json
+            restored_state = InternalState.from_dict({"spontaneous_enabled": False})
+            self.assertFalse(restored_state.spontaneous_enabled)
+            brain = BrainEngine(queue.Queue(), MagicMock(), MagicMock())
+            self.assertFalse(brain._spontaneous_enabled)
+            self.assertFalse(brain._should_speak(time.time() + 9999))
+
+            # POST /toggle_spontaneous with no body flips False -> True
+            resp_flip = client.post("/toggle_spontaneous", json={})
+            self.assertEqual(resp_flip.status_code, 200)
+            self.assertTrue(resp_flip.get_json().get("enabled"))
+            self.assertTrue(AnimeVision._spontaneous_pokes_enabled)
+            self.assertTrue(AnimeVision._load_persisted_spontaneous_enabled())
+
+            # Explicit POST /toggle_spontaneous false -> back true
+            resp_t_off = client.post("/toggle_spontaneous", json={"enabled": False})
+            self.assertEqual(resp_t_off.status_code, 200)
+            self.assertFalse(resp_t_off.get_json().get("enabled"))
+            resp_t_on = client.post("/api/spontaneous", json={"enabled": True})
+            self.assertEqual(resp_t_on.status_code, 200)
+            self.assertTrue(resp_t_on.get_json().get("enabled"))
+        finally:
+            AnimeVision._apply_spontaneous_toggle(orig_enabled)
+            if orig_state_bytes is None:
+                if os.path.exists(state_path):
+                    os.remove(state_path)
+            else:
+                with open(state_path, "wb") as f:
+                    f.write(orig_state_bytes)
+
+    def test_unity_toggle_patch_wiring(self):
+        """AlphaSpontaneousToggle.cs and patch_mateengine_dll.ps1 contain expected UI hooks."""
+        import os
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cs_path = os.path.join(base_dir, "unity_bridge_mod", "AlphaSpontaneousToggle.cs")
+        ps1_path = os.path.join(base_dir, "unity_bridge_mod", "patch_mateengine_dll.ps1")
+        with open(cs_path, "r", encoding="utf-8") as f:
+            cs_src = f.read()
+        with open(ps1_path, "r", encoding="utf-8") as f:
+            ps1_src = f.read()
+
+        self.assertIn("public static void AttachBelow(Toggle templateToggle)", cs_src)
+        self.assertIn("SPONTANEOUS REMARKS", cs_src)
+        self.assertIn("http://127.0.0.1:5001/api/spontaneous", cs_src)
+        self.assertIn("new Toggle.ToggleEvent()", cs_src)
+        self.assertIn("SettingsHandlerToggles", ps1_src)
+        self.assertIn("enableDiscordRPCToggle", ps1_src)
+        self.assertIn("AttachBelow", ps1_src)
+
 
 # ---------------------------------------------------------------------------
 # 20. Sharp Separate Frames, Visual Delta Triggers & Fast Client Tests

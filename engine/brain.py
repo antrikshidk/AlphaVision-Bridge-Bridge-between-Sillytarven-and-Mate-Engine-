@@ -180,6 +180,7 @@ class InternalState:
     last_chat_timestamp: float   = 0.0           # When user last opened/chatted in companion chat
     last_active_timestamp: float = 0.0           # When user was last actively using desktop
     last_sleep_comment_timestamp: float = 0.0     # When a sleep/bed remark last fired (rate-limited to 35m)
+    spontaneous_enabled: bool    = True          # Persisted spontaneous remarks toggle state
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -331,6 +332,7 @@ class BrainEngine:
 
         self._state    = self._load_state()
         self._state.session_start = time.time()
+        self._spontaneous_enabled: bool = bool(getattr(self._state, "spontaneous_enabled", True))
 
         self._last_snap: Optional[PerceptionSnapshot] = None
         self._threads: List[threading.Thread] = []
@@ -551,6 +553,8 @@ class BrainEngine:
 
     def set_spontaneous_enabled(self, enabled: bool):
         self._spontaneous_enabled = bool(enabled)
+        self._state.spontaneous_enabled = self._spontaneous_enabled
+        self._save_state()
 
     def _should_speak(self, now: float) -> bool:
         """Rate-limit gate."""
